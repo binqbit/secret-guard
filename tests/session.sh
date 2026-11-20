@@ -35,6 +35,9 @@ printf '%s\n' "$work" > "$rules/.indexingfolders"
 printf '%s\n' '.env' '.env.*' '.secrets/' > "$rules/.indexingsecrets"
 printf '%s\n' 'target/' > "$rules/.indexingignore"
 chmod 0644 "$rules/.indexingfolders" "$rules/.indexingsecrets" "$rules/.indexingignore"
+# Give both ordinary accounts access to the binary even if the build directory is private.
+install -m 0755 "$guard" /var/lib/sg-test-cli
+guard=/var/lib/sg-test-cli
 for name in .indexingfolders .indexingsecrets .indexingignore; do
     file="$rules/$name"
     as_reader cat "$file" >/dev/null
@@ -49,6 +52,19 @@ printf 'ignored\n' > target/.env
 chown 1000:1000 .env .secrets/key target/.env
 chmod 0640 target/.env
 inode=$(stat -c '%d:%i' .env)
+
+# Public configuration commands read the installed lists, even before the first scan.
+# Keep an empty rule list and a comment visible so an operator can diagnose them.
+printf '%s\n' '# review the paths before the first scan' "$work" > "$rules/.indexingfolders"
+: > "$rules/.indexingignore"
+chmod 0711 /etc
+as_reader "$guard" config show > show.out
+chmod 0755 /etc
+for entry in '[folders]' '[secrets]' '[ignore]' '# review the paths before the first scan' "$work" '.secrets/'; do
+    grep -Fx "$entry" show.out >/dev/null
+done
+[ ! -e /var/lib/secret-guard ]
+printf '%s\n' 'target/' > "$rules/.indexingignore"
 
 # Each invocation reads the current three lists. A root path may contain spaces.
 extra='/var/lib/sg extra root'

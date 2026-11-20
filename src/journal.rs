@@ -28,10 +28,13 @@ enum Storage {
 
 // Open each component relative to the checked parent. Keep the final descriptor pinned.
 fn trusted_directory(path: &Path, storage: Storage) -> Result<File> {
-    let mut directory = File::from(fs::open("/", directory_flags(), Mode::empty())?);
+    // An ordinary config reader needs search access, but need not be able to
+    // list every ancestor. Only the final directory requires a readable handle.
+    let lookup = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = File::from(fs::open("/", lookup, Mode::empty())?);
     for component in path.components() {
         if let Component::Normal(name) = component {
-            directory = fs::openat(&directory, name, directory_flags(), Mode::empty())
+            directory = fs::openat(&directory, name, lookup, Mode::empty())
                 .with_context(|| format!("open trusted directory component {name:?}"))?
                 .into();
         } else {
@@ -49,7 +52,7 @@ fn trusted_directory(path: &Path, storage: Storage) -> Result<File> {
             check_directory_search(&directory, Path::new(component.as_os_str()))?;
         }
     }
-    Ok(directory)
+    Ok(fs::openat(&directory, ".", directory_flags(), Mode::empty())?.into())
 }
 
 fn checked_file(
@@ -96,50 +99,106 @@ fn checked_file(
     Ok(Some(file))
 }
 
-pub fn read_config() -> Result<crate::Scope> {
-    let directory = trusted_directory(Path::new(CONFIG_DIR), Storage::Rules).context(CONFIG_DIR)?;
-    read_lists(&directory, 0, 0)
+#[derive(Clone, Copy)]
+pub enum RuleList {
+    Folders,
+    Secrets,
+    Ignore,
 }
 
-fn read_lists(directory: &File, uid: u32, gid: u32) -> Result<crate::Scope> {
-    let meta = directory.metadata()?;
-    ensure!(
-        meta.uid() == uid && meta.gid() == gid && meta.mode() & 0o7777 == 0o755,
-        "{CONFIG_DIR} must be owned by {uid}:{gid} with mode 0755"
-    );
-    ensure!(
-        acl_allows_public_read(directory)?,
-        "{CONFIG_DIR} has an access ACL entry without read permission"
-    );
-    let lines = |name: &str| -> Result<Vec<String>> {
-        let mut file = checked_file(directory, name, uid, gid, Storage::Rules)?
-            .with_context(|| format!("missing required configuration file {CONFIG_DIR}/{name}"))?;
-        let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .with_context(|| format!("read {CONFIG_DIR}/{name}"))?;
-        Ok(contents
+impl RuleList {
+    pub const ALL: [Self; 3] = [Self::Folders, Self::Secrets, Self::Ignore];
+
+    pub fn filename(self) -> &'static str {
+        match self {
+            Self::Folders => ".indexingfolders",
+            Self::Secrets => ".indexingsecrets",
+            Self::Ignore => ".indexingignore",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        self.filename().trim_start_matches(".indexing")
+    }
+
+    fn entries(self, contents: &str) -> Result<Vec<String>> {
+        let entries: Vec<_> = contents
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .map(str::to_owned)
-            .collect())
-    };
-    let folders = lines(".indexingfolders")?;
-    let patterns = lines(".indexingsecrets")?;
-    let ignores = lines(".indexingignore")?;
-    ensure!(
-        !folders.is_empty(),
-        "list at least one absolute search directory in {CONFIG_DIR}/.indexingfolders"
-    );
-    ensure!(
-        !patterns.is_empty(),
-        "list at least one file or directory pattern in {CONFIG_DIR}/.indexingsecrets"
-    );
-    Ok(crate::Scope {
-        roots: folders.into_iter().map(Into::into).collect(),
-        patterns,
-        ignores,
-    })
+            .collect();
+        let required = match self {
+            Self::Folders => Some("absolute search directory"),
+            Self::Secrets => Some("file or directory pattern"),
+            Self::Ignore => None,
+        };
+        if let Some(required) = required {
+            ensure!(
+                !entries.is_empty(),
+                "list at least one {required} in {CONFIG_DIR}/{}",
+                self.filename()
+            );
+        }
+        Ok(entries)
+    }
+}
+
+pub struct ConfigFiles {
+    directory: File,
+    uid: u32,
+    gid: u32,
+}
+
+impl ConfigFiles {
+    pub fn open() -> Result<Self> {
+        let directory =
+            trusted_directory(Path::new(CONFIG_DIR), Storage::Rules).context(CONFIG_DIR)?;
+        Self::from_directory(directory, 0, 0)
+    }
+
+    fn from_directory(directory: File, uid: u32, gid: u32) -> Result<Self> {
+        let meta = directory.metadata()?;
+        ensure!(
+            meta.uid() == uid && meta.gid() == gid && meta.mode() & 0o7777 == 0o755,
+            "{CONFIG_DIR} must be owned by {uid}:{gid} with mode 0755"
+        );
+        ensure!(
+            acl_allows_public_read(&directory)?,
+            "{CONFIG_DIR} has an access ACL entry without read permission"
+        );
+        Ok(Self {
+            directory,
+            uid,
+            gid,
+        })
+    }
+
+    pub fn read(&self, list: RuleList) -> Result<String> {
+        let name = list.filename();
+        let mut file = checked_file(&self.directory, name, self.uid, self.gid, Storage::Rules)?
+            .with_context(|| format!("missing required configuration file {CONFIG_DIR}/{name}"))?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .with_context(|| format!("read {CONFIG_DIR}/{name}"))?;
+        Ok(contents)
+    }
+
+    fn scope(&self) -> Result<crate::Scope> {
+        let entries = |list: RuleList| list.entries(&self.read(list)?);
+        Ok(crate::Scope {
+            roots: entries(RuleList::Folders)?
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            patterns: entries(RuleList::Secrets)?,
+            ignores: entries(RuleList::Ignore)?,
+        })
+    }
+}
+
+pub fn read_config() -> Result<crate::Scope> {
+    ConfigFiles::open()?.scope()
 }
 
 pub struct JournalStore {
@@ -310,6 +369,7 @@ mod tests {
         let uid = directory.metadata()?.uid();
         let gid = directory.metadata()?.gid();
         disk::set_permissions(tmp.path(), disk::Permissions::from_mode(0o755))?;
+        let read_lists = || ConfigFiles::from_directory(directory.try_clone()?, uid, gid)?.scope();
         let write = |name: &str, text: &str| -> Result<()> {
             let path = tmp.path().join(name);
             disk::write(&path, text)?;
@@ -321,9 +381,9 @@ mod tests {
             "# Projects\n/srv/first project\n/srv/second\n",
         )?;
         write(".indexingsecrets", " .env \n\n.secrets/\n")?;
-        assert!(read_lists(&directory, uid, gid).is_err());
+        assert!(read_lists().is_err());
         write(".indexingignore", "# No exclusions\n")?;
-        let scope = read_lists(&directory, uid, gid)?;
+        let scope = read_lists()?;
         assert_eq!(
             scope.roots,
             [Path::new("/srv/first project"), Path::new("/srv/second")]
@@ -332,20 +392,17 @@ mod tests {
         assert!(scope.ignores.is_empty());
         for mode in [0o700, 0o750, 0o775, 0o777] {
             disk::set_permissions(tmp.path(), disk::Permissions::from_mode(mode))?;
-            assert!(read_lists(&directory, uid, gid).is_err());
+            assert!(read_lists().is_err());
         }
         disk::set_permissions(tmp.path(), disk::Permissions::from_mode(0o755))?;
 
         write(".indexingignore", "target/\n.env.example\n")?;
-        assert_eq!(
-            read_lists(&directory, uid, gid)?.ignores,
-            ["target/", ".env.example"]
-        );
+        assert_eq!(read_lists()?.ignores, ["target/", ".env.example"]);
         write(".indexingsecrets", "# No selection\n")?;
-        assert!(read_lists(&directory, uid, gid).is_err());
+        assert!(read_lists().is_err());
         write(".indexingsecrets", ".env\n")?;
         write(".indexingfolders", "\n")?;
-        assert!(read_lists(&directory, uid, gid).is_err());
+        assert!(read_lists().is_err());
         Ok(())
     }
 

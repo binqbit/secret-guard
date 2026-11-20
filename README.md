@@ -37,8 +37,10 @@ If sudo cannot find `secret-guard`, use `/usr/local/bin/secret-guard` in its pla
 
 Secret Guard reads three lists from **`/etc/secret-guard/`**. Any local user or agent can read them without sudo, including while secrets are locked. Only root can edit or replace the installed lists. Their paths, patterns and comments are public, so keep credential values in `.secrets/`. The files at the root of this repository are installation templates.
 
+Run `config show` as your ordinary user to see the contents of all three lists under the headings `[folders]`, `[secrets]` and `[ignore]`.
+
 ```sh
-cat /etc/secret-guard/.indexingfolders /etc/secret-guard/.indexingsecrets /etc/secret-guard/.indexingignore
+secret-guard config show
 sudoedit /etc/secret-guard/.indexingfolders
 ```
 

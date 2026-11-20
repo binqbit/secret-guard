@@ -1,6 +1,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("Secret Guard requires Linux.");
 
+mod config;
 mod journal;
 mod runtime;
 mod state;
@@ -31,6 +32,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Display the installed configuration lists.
+    Config {
+        #[command(subcommand)]
+        command: config::Action,
+    },
     /// List matching working files under the configured roots.
     Scan,
     /// Show current file permissions and any open session.
@@ -164,11 +170,18 @@ fn mutate(
 }
 
 fn run(cli: Cli) -> Result<i32> {
+    let Cli { action, user } = cli;
+    if let Action::Config {
+        command: config::Action::Show,
+    } = action
+    {
+        config::show()?;
+        return Ok(0);
+    }
     ensure!(
         unsafe { libc::geteuid() == 0 && libc::getuid() == 0 },
         "run Secret Guard through sudo"
     );
-    let Cli { action, user } = cli;
     let store = JournalStore::open()?;
     let idle = store.try_exclusive()?;
     if !idle && matches!(action, Action::Lock | Action::Session { .. }) {
@@ -186,6 +199,7 @@ fn run(cli: Cli) -> Result<i32> {
     let user = runtime::resolve_user(user.as_deref())?;
     let tree = Tree::new(&scope.roots, &scope.patterns, &scope.ignores, user.uid)?;
     match action {
+        Action::Config { .. } => unreachable!(),
         Action::Scan => {
             for path in tree.scan()?.keys() {
                 println!("{path:?}");
