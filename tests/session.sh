@@ -83,6 +83,55 @@ grep -Fx 'No open session.' first-status.out >/dev/null
 grep -Fx "public-read mode  1000:1000 0644  \"$editor_home/.env\"" first-status.out >/dev/null
 cmp /etc/editor-defaults/.indexingfolders "$rules/.indexingfolders"
 
+# Reset rewrites exactly the three rules for the selected account.
+if "$guard" reset config > invalid-command.log 2>&1; then echo 'Accepted a top-level reset' >&2; exit 1; fi
+grep -F "unrecognized subcommand 'reset'" invalid-command.log >/dev/null
+before_reset=$(stat -c '%d:%i:%u:%g:%a' "$editor_home/.env")
+printf '%s\n' 'keep admin note' > "$rules/admin-note"
+mkdir "$rules/local-settings"
+printf '%s\n' 'keep this too' > "$rules/local-settings/note"
+printf '%s\n' "$reader_home" > "$rules/.indexingfolders"
+printf '%s\n' 'custom.key' > "$rules/.indexingsecrets"
+printf '%s\n' 'custom/' > "$rules/.indexingignore"
+"$guard" config reset
+for name in .indexingfolders .indexingsecrets .indexingignore; do
+    cmp "/etc/editor-defaults/$name" "$rules/$name"
+    [ "$(stat -c '%u:%g:%a' "$rules/$name")" = '0:0:644' ]
+    as_reader cat "$rules/$name" >/dev/null
+done
+# A bad target aborts the entire reset, including lists before it in the write order.
+printf '%s\n' 'custom.key' > "$rules/.indexingsecrets"
+rm "$rules/.indexingignore"
+ln -s "$rules/admin-note" "$rules/.indexingignore"
+if "$guard" config reset > unsafe-reset.log 2>&1; then echo 'Reset a symlinked list' >&2; exit 1; fi
+[ -L "$rules/.indexingignore" ]
+[ "$(cat "$rules/.indexingsecrets")" = 'custom.key' ]
+rm "$rules/.indexingignore"
+ln "$rules/admin-note" "$rules/.indexingignore"
+if "$guard" config reset > unsafe-reset.log 2>&1; then echo 'Reset a hard-linked list' >&2; exit 1; fi
+[ "$(stat -c %h "$rules/admin-note")" = 2 ]
+[ "$(cat "$rules/.indexingsecrets")" = 'custom.key' ]
+rm "$rules/.indexingignore"
+(unset SUDO_UID; "$guard" --user reader config reset)
+cmp /etc/reader-defaults/.indexingfolders "$rules/.indexingfolders"
+cmp "$templates/.indexingsecrets" "$rules/.indexingsecrets"
+cmp "$templates/.indexingignore" "$rules/.indexingignore"
+# Make the last list temporarily unreplaceable after the reset has begun.
+# Readers must refuse the interrupted snapshot until the same reset succeeds.
+mount -n --bind "$rules/admin-note" "$rules/.indexingignore"
+if "$guard" config reset > interrupted-reset.log 2>&1; then echo 'Replaced a mounted rule file' >&2; exit 1; fi
+if as_reader "$guard" config show > interrupted-show.log 2>&1; then echo 'Read interrupted reset as complete' >&2; exit 1; fi
+grep -F 'reset' interrupted-show.log >/dev/null
+umount -n "$rules/.indexingignore"
+"$guard" config reset
+as_reader "$guard" config show > reset-show.out
+for name in .indexingfolders .indexingsecrets .indexingignore; do
+    cmp "/etc/editor-defaults/$name" "$rules/$name"
+done
+[ "$(cat "$rules/admin-note")" = 'keep admin note' ]
+[ "$(cat "$rules/local-settings/note")" = 'keep this too' ]
+[ "$(stat -c '%d:%i:%u:%g:%a' "$editor_home/.env")" = "$before_reset" ]
+[ "$(cat "$editor_home/.env")" = 'bootstrap fixture' ]
 mv /var/lib/secret-guard /var/lib/first-status-state
 
 printf '%s\n' "$work" > "$rules/.indexingfolders"
@@ -231,6 +280,8 @@ for attempt in $(seq 1 100); do
     sleep 0.1
 done
 [ -e ready ] || { echo 'Timed out waiting for the session' >&2; exit 1; }
+if "$guard" config reset > reset-open.log 2>&1; then echo 'Reset an active session' >&2; exit 1; fi
+grep -Fx "$work" "$rules/.indexingfolders" >/dev/null
 [ "$(stat -c '%u:%g:%a' /var/lib/secret-guard)" = '0:0:700' ]
 locked /var/lib/secret-guard/session.json
 if as_reader cat /var/lib/secret-guard/session.json >/dev/null 2>&1; then echo 'Reader can read private journal' >&2; exit 1; fi
@@ -263,6 +314,8 @@ grep -F "$work/.env.busy" busy.log >/dev/null
 grep -F 'sudo secret-guard lock' busy.log >/dev/null
 [ "$(stat -c '%u:%g:%a' .env.busy)" = '1000:1000:644' ]
 locked .env.available
+if "$guard" config reset > reset-recovery.log 2>&1; then echo 'Reset with unfinished recovery' >&2; exit 1; fi
+grep -Fx "$work" "$rules/.indexingfolders" >/dev/null
 exec 3<&-
 # A permissions-only upgrade preserves both the operator's rules and recovery.
 chmod 0700 "$rules"

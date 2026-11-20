@@ -32,7 +32,7 @@ secret-guard config show
 
 The default search root is **the whole home directory of the ordinary user who first invokes sudo for setup**. Secret Guard replaces `/home/user` in the folder template with the home recorded for that UID in the system account database. For a user whose home is `/srv/users/alice`, the installed list contains `/srv/users/alice`. From a root shell, select the intended account explicitly with `secret-guard --user alice config show`.
 
-The installed lists are system-wide. Normal use and binary upgrades preserve your edits. If an installed list is missing, restore it before using the configuration. Only root can change the lists. Their paths, patterns and comments are public, so keep credential values in `.secrets/`.
+The installed lists are system-wide. Normal use and binary upgrades preserve your edits. If an installed list is missing, restore it or explicitly reset all three lists to the packaged defaults. Only root can change the lists. Their paths, patterns and comments are public, so keep credential values in `.secrets/`.
 
 To manage a single project, run `secret-guard config edit folders` and replace the home entry with that project's absolute path before locking. The walkthrough below uses `/srv/work/api`. All local users must be able to traverse every parent of a file to unlock it. A private home with mode `0700` prevents unlocking files beneath it, even when the selected root is a project inside that home. Secret Guard reports the blocking directory.
 
@@ -74,6 +74,19 @@ locked  0:0 0600  "/srv/work/api/.secrets/service.key"
 ```
 
 The first status line describes the session. Each file then gets a label (`locked`, `public-read mode` or `unmanaged or changed`), followed by its owner ID, group ID and mode. A new file can be publicly readable while the first line says `No open session.`
+
+### Reset the configuration
+
+Run `secret-guard config reset` to **overwrite all three installed lists** with the defaults embedded in the current binary. The command requests sudo and sets the search root to the calling user's home. From a root shell, select the ordinary account with `secret-guard --user alice config reset`.
+
+Reset requires closed access. Finish an active session, or run `sudo secret-guard lock` to recover an interrupted session. The reset changes only the three rule lists. Existing secrets keep their contents and permissions. Save any rules you want to reuse. A locked file outside the new selection stays root-only until you include it again.
+
+```sh
+secret-guard config reset
+secret-guard config show
+```
+
+If the reset is interrupted, run it again from the same account and review the resulting lists.
 
 ## Everyday use
 

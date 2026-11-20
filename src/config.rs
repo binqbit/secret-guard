@@ -3,16 +3,19 @@ use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::Subcommand;
 
 use crate::journal::{self, ConfigFiles, RuleList};
+use crate::state::Session;
 use crate::{editor, runtime};
 
 #[derive(Subcommand)]
 pub enum Action {
     /// Show all three lists, initializing the installed defaults on first use.
     Show,
+    /// Replace all three installed lists with the packaged defaults for your account.
+    Reset,
     /// Open one installed list in a terminal editor.
     Edit {
         #[arg(value_enum)]
@@ -26,12 +29,12 @@ pub enum Action {
 fn show() -> Result<()> {
     let files = ConfigFiles::open()?;
     let mut output = String::new();
-    for list in RuleList::ALL {
+    for (list, contents) in files.read_all()? {
         if !output.is_empty() {
             output.push('\n');
         }
         output.push_str(&format!("[{}]\n", list.name()));
-        output.push_str(&files.read(list)?);
+        output.push_str(&contents);
         if !output.ends_with('\n') {
             output.push('\n');
         }
@@ -50,8 +53,28 @@ fn run_with_sudo(selected_user: Option<&str>, args: &[&str]) -> Result<i32> {
     Err(sudo.arg("config").args(args).exec()).context("start sudo for Secret Guard configuration")
 }
 
+fn reset(selected_user: Option<&str>) -> Result<i32> {
+    if !rustix::process::geteuid().is_root() {
+        return run_with_sudo(selected_user, &["reset"]);
+    }
+    let user = runtime::resolve_user(selected_user)?;
+    let store = journal::JournalStore::open()?;
+    ensure!(
+        store.try_exclusive()?,
+        "another Secret Guard operation is active; finish it before resetting the configuration"
+    );
+    ensure!(
+        store.load::<Session>()?.is_none(),
+        "an unfinished operation needs recovery; run 'sudo secret-guard lock' before resetting the configuration"
+    );
+    journal::reset_config(&user.home)?;
+    println!("Restored the three installed rule lists to their packaged defaults.");
+    Ok(0)
+}
+
 pub fn run(action: Action, selected_user: Option<&str>) -> Result<i32> {
     let (list, editor) = match action {
+        Action::Reset => return reset(selected_user),
         Action::Show => {
             if journal::is_uninitialized()? {
                 if !rustix::process::geteuid().is_root() {

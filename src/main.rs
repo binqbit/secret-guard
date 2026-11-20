@@ -33,7 +33,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Display or edit the installed configuration lists.
+    /// Display, edit or reset the installed configuration lists.
     Config {
         #[command(subcommand)]
         command: config::Action,
