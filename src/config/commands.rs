@@ -89,21 +89,18 @@ fn reset(selected_user: Option<&str>) -> Result<i32> {
     let user = runtime::resolve_user(selected_user)?;
     let store = JournalStore::open()?;
     let admission = store.admission()?;
-    if let Some(entry) = session::operations(&store)?.first() {
+    if let Some(entry) = session::operations(&store)?
+        .iter()
+        .find(|e| e.occupies_slot())
+    {
         let label = entry.slot.label(entry.root());
         ensure!(
             entry.idle,
             "session {label} is active; finish it before resetting the configuration"
         );
 
-        let session = entry.session.as_ref().context("missing session state")?;
-        let state = if session.is_manual_open() {
-            "files are manually unlocked"
-        } else {
-            "an unfinished operation needs recovery"
-        };
         let hint = entry.slot.close_hint(entry.root());
-        bail!("session {label}: {state}. {hint}");
+        bail!("session {label}: an unfinished operation needs recovery. {hint}");
     }
 
     files::reset_config(&user.home)?;

@@ -180,7 +180,8 @@ impl JournalStore {
     }
 
     /// After an operation finishes, the caller holds admission and the same slot
-    /// lock. rmdir also fails safely if any journal or pending write remains.
+    /// lock. Keep the directory if a manual unlock still needs its saved scope.
+    /// rmdir also fails safely if any journal or pending write remains.
     pub(crate) fn remove_direct(&self, root_id: (u64, u64), store: &Self) -> Result<()> {
         store.require_lock()?;
 
@@ -192,6 +193,9 @@ impl JournalStore {
             "path session state directory was replaced"
         );
 
+        if !store.receipts()?.is_empty() {
+            return Ok(());
+        }
         fs::unlinkat(&self.directory, entry.as_str(), AtFlags::REMOVEDIR)
             .context("remove empty path session state")?;
         self.directory

@@ -29,8 +29,9 @@ impl Target {
         selection: &Selection,
         uid: u32,
         mutate: bool,
+        find_receipts: bool,
     ) -> Result<Self> {
-        let (slot, supplied) = selection.resolve(entries)?;
+        let (slot, supplied) = selection.resolve(entries, find_receipts)?;
         let store = slot.open(registry, false)?;
 
         let (root, binding_uid) = if let Slot::Named(name) = &slot {
@@ -64,30 +65,23 @@ impl Target {
         &self,
         caller: &User,
         owner_uid: u32,
-        saved: Option<&Scope>,
         session: Option<&Session>,
     ) -> Result<(Scope, Tree)> {
-        let scope = match saved {
-            Some(scope) => scope.clone(),
+        let (scope, tree) = match session {
+            Some(saved) => (saved.scope().clone(), saved_tree(saved, owner_uid)?),
             None => {
                 config::initialize_if_needed(&caller.home)?;
-                config::read_config(self.root.as_deref())?
+                let scope = config::read_config(self.root.as_deref())?;
+                let tree = Tree::new(&scope.roots, &scope.patterns, &scope.ignores, owner_uid)?;
+                overlap::check_selection(&tree)?;
+                (scope, tree)
             }
         };
-
-        let tree = Tree::new(&scope.roots, &scope.patterns, &scope.ignores, owner_uid)?;
         if let Slot::Direct(id) = self.slot {
             ensure!(
                 tree.root_ids()?.as_slice() == [id],
                 "restore the original directory for this session"
             );
-        }
-
-        if let Some(session) = session {
-            session.validate(&tree, owner_uid, &scope)?;
-            overlap::check_protected_roots(&tree)?;
-        } else {
-            overlap::check_selection(&tree)?;
         }
 
         Ok((scope, tree))
@@ -97,7 +91,7 @@ impl Target {
         let Some(store) = &self.store else {
             ensure!(
                 approved.is_none(),
-                "the confirmed session has already closed; run session again"
+                "the confirmed session has already closed; retry the command"
             );
             return Ok(None);
         };
@@ -111,7 +105,13 @@ impl Target {
             store.verify_session(snapshot)?;
         }
 
-        store.load()
+        let session = store.load::<Session>()?;
+        if session.as_ref().is_some_and(Session::is_manual_open) {
+            store.archive_unlock()?;
+            Ok(None)
+        } else {
+            Ok(session)
+        }
     }
 
     pub(super) fn claim(&mut self, registry: &JournalStore, uid: u32) -> Result<JournalStore> {
@@ -136,6 +136,14 @@ impl Target {
         }
         Ok(store)
     }
+}
+
+pub(super) fn saved_tree(session: &Session, uid: u32) -> Result<Tree> {
+    let scope = session.scope();
+    let tree = Tree::new(&scope.roots, &scope.patterns, &scope.ignores, uid)?;
+    session.validate(&tree, uid, scope)?;
+    overlap::check_protected_roots(&tree)?;
+    Ok(tree)
 }
 
 fn named_root(

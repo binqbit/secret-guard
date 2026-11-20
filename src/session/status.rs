@@ -26,7 +26,7 @@ pub(crate) fn status(
     let (entries, target) = {
         let _guard = registry.admission()?;
         let entries = admission::operations(registry)?;
-        let target = Target::resolve(registry, &entries, selection, caller.uid, false)?;
+        let target = Target::resolve(registry, &entries, selection, caller.uid, false, !paths)?;
         (entries, target)
     };
 
@@ -42,10 +42,31 @@ pub(crate) fn status(
     };
     let user = owner.as_ref().unwrap_or(caller);
 
-    // Full status describes the open session. --paths previews the installed rules.
-    let saved = session.filter(|_| !paths);
-    let (_, tree) = target.tree(caller, user.uid, saved.map(Session::scope), saved)?;
-    display::show_files(tree.scan()?, user, paths)?;
+    // Status reports observed permissions, including files covered by a saved
+    // manual unlock. --paths always previews the current configuration.
+    let mut scopes: Vec<&Session> = Vec::new();
+    if !paths {
+        scopes.extend(session);
+        if let Some(entry) = entry {
+            scopes.extend(
+                entry
+                    .receipts
+                    .iter()
+                    .filter(|r| r.uid == user.uid && session.is_none_or(|s| !s.same_selection(r))),
+            );
+        }
+    }
+    let files = if scopes.is_empty() {
+        target.tree(caller, user.uid, None)?.1.scan()?
+    } else {
+        let mut files = std::collections::BTreeMap::new();
+        for scope in scopes {
+            let (_, tree) = target.tree(caller, user.uid, Some(scope))?;
+            files.extend(tree.scan()?);
+        }
+        files
+    };
+    display::show_files(files, user, paths)?;
     Ok(0)
 }
 
@@ -56,7 +77,7 @@ fn describe_status(target: &Target, entries: &[Entry], selected: Option<&Entry>)
     if target.slot == Slot::Default {
         let mut peers = entries
             .iter()
-            .filter(|entry| entry.slot != Slot::Default)
+            .filter(|entry| entry.slot != Slot::Default && entry.occupies_slot())
             .peekable();
         let show_default = peers.peek().is_some() || palette.is_terminal();
 

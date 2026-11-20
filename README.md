@@ -68,7 +68,7 @@ The entries below illustrate how to exclude files and directory trees in `.index
 
 ### 3. Preview the selection, then lock it
 
-Run these commands from the ordinary account that owns the project secrets. `status --paths` lists matches under the selected roots using the currently installed rules. Full `status` shows file permissions for the selected session and uses its saved roots and rules while it is open. With no selector it also summarizes open named and directory sessions.
+Run these commands from the ordinary account that owns the project secrets. `status --paths` previews the currently installed rules. Full `status` reports the selected operation and the actual file permissions, including files covered by its saved manual unlock rules. With no selector it also summarizes active and interrupted operations for other names and directories.
 
 For a project with `.env`, `.secrets/service.key`, `.env.example` and `target/.env`, the example rules select two files. **Review the paths before the first lock.**
 
@@ -94,7 +94,7 @@ Run `sudo secret-guard status` directly to see the session name and a table of f
 
 Run `secret-guard config reset` to **overwrite all three installed lists** with the defaults embedded in the current binary. The command requests sudo and sets the search root to the calling user's home. From a root shell, select the ordinary account with `secret-guard --user alice config reset`.
 
-Reset requires closed access for **all** sessions. Use `sudo secret-guard status` to find them. Finish supervised sessions and run `lock` with the matching name or directory for each manual unlock or interrupted operation. A reset replaces the three rule lists. Saved session names keep their directory bindings, and secrets keep their contents and permissions. Save any rules you want to reuse. A locked file outside the new selection stays root-only until you include it again.
+Finish active operations and recover interrupted ones before resetting. A completed manual `unlock` allows a reset. Its saved rules let you close access afterward with the same selector, even if the new configuration selects different files. Save any custom rules you want to reuse. Resetting changes the installed lists and preserves file permissions and saved name bindings.
 
 ```sh
 secret-guard config reset
@@ -105,7 +105,7 @@ If the reset is interrupted, run it again from the same account and review the r
 
 ## Everyday use
 
-**To unlock manually**, run `unlock`. It prints `UNLOCKED` and returns you to the shell. You can read and edit the matching files without sudo until you run `lock`, even if you close the terminal. Use the same account and selector to close access.
+**To unlock manually**, run `unlock`. It gives your account access to the matching files, prints `UNLOCKED` and exits. The files stay accessible after you close the terminal. A successful manual unlock releases the session slot. Full `status` then reports `No open session.` and shows the file permissions.
 
 ```console
 $ sudo secret-guard unlock
@@ -114,7 +114,7 @@ $ sudo secret-guard lock
 LOCKED
 ```
 
-Closing a manual unlock uses its saved rules, even if you edited the installed lists or the operation was interrupted.
+Use the same account and selector for a repeat `unlock` or a later `lock`. A repeat unlock uses the saved rules. Lock rescans every outstanding selection for that selector and includes new files that match those rules. A fresh `session` uses the current configuration and locks its own selection on exit, including files previously unlocked manually that match it.
 
 **To lock on Enter**, start a session in a foreground terminal.
 
@@ -161,16 +161,20 @@ The preview does not register the name. Once registered, a name identifies the s
 
 For a one-off session, supply the path directly, for example `sudo secret-guard session /srv/work/web`. From `/srv/work`, `sudo secret-guard session ./web` selects the same directory. A bare word such as `web` selects a saved name. You can also supply `--path DIR` without a name. After a manual `unlock ./web`, close it with `sudo secret-guard lock ./web` from the same working directory, or pass its absolute path.
 
-An open session reserves its name until closure, including during manual access and crash recovery. Two operations can run together if their roots are disjoint or the parent scan skips the entire nested project. For example, with `/srv/work` as the default root and `./api/` in its ignore list, `session` and `session /srv/work/api` can run concurrently. Closing the default session skips `api`, including new files there. Ignoring only `./api/fixtures/` still leaves an overlap. The check uses the rules each operation opened with and detects bind aliases. Two active operations cannot select the same physical directory.
+Active and interrupted operations reserve their selector and the directories they scan. Two operations can run together if their roots are disjoint or the parent scan skips the entire nested project. For example, with `/srv/work` as the default root and `./api/` in its ignore list, `session` and `session /srv/work/api` can run concurrently. Closing the default session skips `api`, including new files there. Ignoring only `./api/fixtures/` still leaves an overlap. The check uses the rules each operation opened with and detects bind aliases. Two active operations cannot select the same physical directory.
+
+After `unlock /srv/work/api` completes, you can start a default session using the current default rules. If they exclude `api`, the project files remain accessible after the default session exits. Use `lock /srv/work/api` to close manual access to that project.
 
 ### When an earlier session blocks a new one
 
-Suppose you manually unlocked `/srv/work/api` and then run `sudo secret-guard session` for the default root `/srv/work`. In a foreground terminal, Secret Guard identifies the open session and asks whether to reset it. The same prompt is available if your earlier supervisor exited before it finished locking. It applies to your own session when you select it again or request overlapping roots.
+If your earlier process stopped before it finished, choose the command that gives you the access you need.
 
-- Type `y` or `yes` and press Enter to close the indicated session. Secret Guard locks its matching files, verifies closure, and then retries the session you requested. If a file is busy, release it and follow the retry prompt. After the new session reports `UNLOCKED`, Enter closes it as usual.
-- Press Enter at `[y/N]` to cancel the new request and leave the earlier session open. Any other answer or end of input also cancels. To restore the packaged configuration separately, use `config reset`.
+| Command in a foreground terminal | What confirming the reset does |
+| --- | --- |
+| `sudo secret-guard unlock /srv/work/api` | Reopens an interrupted operation under this exact selector and your UID using its saved rules. Files already unlocked stay accessible during the reset. On success the interrupted session is gone. |
+| `sudo secret-guard session /srv/work/api` | Closes your indicated interrupted operation, verifies its files are locked and retries the requested session. This also works for an interrupted operation whose scan overlaps the requested project. |
 
-A running supervisor must finish in its own terminal. A session belonging to another UID must be closed by its original user. In command mode (`session -- COMMAND`) or without a foreground terminal, use `sudo secret-guard status` to identify the conflict. When you're ready to close your manual or interrupted session, target its original name or path, for example `sudo secret-guard lock /srv/work/api`, before retrying.
+Read the displayed selector and roots before typing `y` or `yes`. Press Enter at `[y/N]` to cancel and preserve the earlier state. To close an interrupted operation directly, use `lock` with its original name or directory. An `unlock` blocked by an interrupted operation under a different selector requires that targeted recovery first. A running session must finish in its own terminal. Another UID's interrupted operation must be recovered by its original user. Command sessions and processes without a foreground terminal report conflicts without prompting.
 
 ## If a file is busy or the session stops
 
@@ -186,12 +190,14 @@ Close the listed file in the process using it, or stop that process. Return to t
 
 | What you see | What to do |
 | --- | --- |
-| `OPEN / manual` | The `unlock` command completed. When finished, run `lock` with the same selector from the account that opened access. |
+| `No open session.` and `owner-only mode` | The account can access the indicated file. After a manual unlock, run `lock` with that selector when you finish. |
 | `OPEN / active` | Return to the session terminal, or let its work command finish. Ctrl+C requests an orderly close. |
-| `OPEN / recovery required` | The supervisor has exited. Resolve the reported problem and run `lock` as the original user with the same selector. Check that session's `status` afterward. |
+| `OPEN / recovery required` | Resolve the reported problem. Run `lock` as the original user to close access, or use interactive `unlock` with the same selector to restore manual access. Check `status` afterward. |
 | Busy paths in a job without a foreground terminal | The job exits with an error and leaves the operation open. Release the files and retry `lock` with the same selector. |
 
-A crash or power loss can leave files unlocked. Secret Guard records the opening user, phase, directory identities and rules in a separate root-only journal for each open operation under `/var/lib/secret-guard/`. The default session uses `session.json`. A successful close removes that session's journal. Named and directory sessions recover using their saved selection and original directory. For an interrupted default supervised session, restore its original directories and list entries in their original order if they have changed.
+A crash or power loss can leave files unlocked. Secret Guard stores the user, operation phase, directory identities and selection rules under `/var/lib/secret-guard/`. An interrupted operation retains a recovery journal. A completed manual unlock keeps its rules separately for later locking. If a saved root has moved or been replaced, restore the original directory before recovery.
+
+If a manual unlock fails partway through a scope that already contained user-owned files, Secret Guard preserves existing access and reports the operation as open. Inspect the paths with `status`, then use the same selector with `unlock` to resume or `lock` to close access.
 
 ## Security model
 
@@ -241,7 +247,7 @@ Secret Guard selects files using the three installed lists. A real `.env` can th
 <details>
 <summary>Upgrading from an older access mode, configuration or storage format</summary>
 
-Close active and manual sessions with the CLI version that opened them before switching versions. Earlier releases coordinate only the default journal. Use one installed version for all concurrent file operations.
+Finish running operations before replacing the binary. Use one installed version for all concurrent file operations. This release recognizes a completed manual unlock recorded in the older version 3 journal format. Its saved selection remains available to `lock`, and fresh sessions can start without resetting it. An interrupted opening or closing still requires recovery. If you are upgrading from a release that predates per-project journals, close its sessions with the original binary first.
 
 If your previous release opened secrets at `0644`, finish any supervised session and run `sudo secret-guard lock` as the account that opened them before upgrading. Reopen with `unlock` or `session` after installing this release. The files will then belong to the opening user at `0600`.
 

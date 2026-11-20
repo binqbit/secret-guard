@@ -109,7 +109,11 @@ impl Selection {
         }
     }
 
-    pub(super) fn resolve(&self, entries: &[Entry]) -> Result<(Slot, Option<PathBuf>)> {
+    pub(super) fn resolve(
+        &self,
+        entries: &[Entry],
+        find_receipts: bool,
+    ) -> Result<(Slot, Option<PathBuf>)> {
         let root = self.path.as_deref().map(absolute_root).transpose()?;
         let direct = match self.selector.as_deref() {
             None => match root {
@@ -129,10 +133,9 @@ impl Selection {
 
         // Prefer an open record at this exact location even after replacement.
         // Recovery then reports the original inode mismatch instead of creating a new slot.
-        if let Some(entry) = entries
-            .iter()
-            .find(|e| matches!(e.slot, Slot::Direct(_)) && e.root() == Some(&direct))
-        {
+        if let Some(entry) = entries.iter().find(|e| {
+            e.occupies_slot() && matches!(e.slot, Slot::Direct(_)) && e.root() == Some(&direct)
+        }) {
             return Ok((entry.slot.clone(), Some(direct)));
         }
 
@@ -149,13 +152,25 @@ impl Selection {
         let metadata = fd.metadata()?;
         let slot = Slot::Direct((metadata.dev(), metadata.ino()));
 
-        if let Some(entry) = entries.iter().find(|e| e.slot == slot)
-            && let Some(original) = entry.root()
+        if let Some(entry) = entries.iter().find(|e| e.slot == slot) {
+            if find_receipts && !entry.occupies_slot() && entry.has_receipt_at(&direct) {
+                return Ok((slot, Some(direct)));
+            }
+            if (entry.occupies_slot() || find_receipts)
+                && let Some(original) = entry.root()
+            {
+                ensure!(
+                    original == direct,
+                    "directory session is open at its original path {original:?}"
+                );
+            }
+        }
+        if find_receipts
+            && entries.iter().any(|e| {
+                matches!(e.slot, Slot::Direct(_)) && e.slot != slot && e.has_receipt_at(&direct)
+            })
         {
-            ensure!(
-                original == direct,
-                "directory session is open at its original path {original:?}"
-            );
+            anyhow::bail!("restore the original directory at {direct:?} for the saved unlock");
         }
         Ok((slot, Some(direct)))
     }

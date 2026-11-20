@@ -264,8 +264,9 @@ locked "$home_env"
 if as_editor cat "$home_env" >/dev/null 2>&1; then echo 'Home secret still readable after session' >&2; exit 1; fi
 "$guard" unlock
 SHELL=/bin/sh script -eqfc "$guard status" /dev/null </dev/null > open.tty
-expect_tone 'OPEN / manual' 32 open.tty
 expect_tone 'owner-only mode' 32 open.tty
+[ ! -e /var/lib/secret-guard/session.json ]
+locked /var/lib/secret-guard/unlocked.json
 [ "$(as_editor cat "$home_env")" = 'private session edit' ]
 [ "$(stat -c '%u:%g:%a' "$home_env")" = '1000:1000:600' ]
 [ "$(stat -c '%u:%g:%a' "$editor_home")" = '1000:1000:700' ]
@@ -479,7 +480,9 @@ grep -Fx "locked  0:0 0600  \"$work/.env\"" locked-status.out >/dev/null
 setsid --fork --wait "$guard" unlock </dev/null > unlock.out
 grep -Fx 'UNLOCKED' unlock.out >/dev/null
 "$guard" status > manual-status.out
-grep -F 'OPEN / manual' manual-status.out >/dev/null
+[ ! -e /var/lib/secret-guard/session.json ]
+locked /var/lib/secret-guard/unlocked.json
+grep -Fx 'No open session.' manual-status.out >/dev/null
 grep -Fx "owner-only mode  1000:1000 0600  \"$work/.env\"" manual-status.out >/dev/null
 if grep -F 'recovery required' manual-status.out >/dev/null; then echo 'Manual unlock reported as a crash' >&2; exit 1; fi
 [ "$(as_editor cat "$work/.env")" = before ]
@@ -488,9 +491,14 @@ if as_reader cat "$legacy_file" >/dev/null 2>&1; then echo 'Legacy fixture staye
 if as_reader cat "$work/.env" >/dev/null 2>&1; then echo 'Reader can read after manual unlock' >&2; exit 1; fi
 if as_reader cat "$work/.secrets/key" >/dev/null 2>&1; then echo 'Named ACL grants read after unlock' >&2; exit 1; fi
 if as_reader sh -c ': >> .env' 2>/dev/null; then echo 'Reader can write after manual unlock' >&2; exit 1; fi
-if "$guard" session -- touch unexpected-session > rejected-session.log 2>&1; then echo 'Session took over manual unlock' >&2; exit 1; fi
-[ ! -e unexpected-session ]
-if "$guard" config reset > reset-manual.log 2>&1; then echo 'Reset manually unlocked rules' >&2; exit 1; fi
+# A successful manual unlock reserves no supervisor slot. Ordinary sessions
+# and configuration reset can run without prompting the operator to recover it.
+"$guard" session -- touch supervised-after-unlock
+[ -e supervised-after-unlock ] && locked "$work/.env" || exit 1
+"$guard" unlock
+for name in .indexingfolders .indexingsecrets .indexingignore; do cp "$rules/$name" "$work/$name.saved"; done
+"$guard" config reset
+for name in .indexingfolders .indexingsecrets .indexingignore; do cp "$work/$name.saved" "$rules/$name"; done
 if (unset SUDO_UID; "$guard" --user reader unlock) > wrong-user.log 2>&1; then
     echo 'A different account took over manually unlocked files' >&2; exit 1
 fi
@@ -523,6 +531,11 @@ locked .env
 "$guard" status > manual-recovery.out
 grep -F 'OPEN / recovery required' manual-recovery.out >/dev/null
 if "$guard" unlock > manual-reopen.log 2>&1; then echo 'Unlock took over partial manual close' >&2; exit 1; fi
+printf 'yes\n' | SHELL=/bin/sh timeout 5 script -eqfc "$guard unlock" /dev/null 3<&- > manual-reset.log
+grep -F '[y/N]' manual-reset.log >/dev/null
+[ "$(stat -c '%u:%g:%a' .env)" = '1000:1000:600' ]
+[ "$(stat -c '%u:%g:%a' .env.manual)" = '1000:1000:600' ]
+[ ! -e /var/lib/secret-guard/session.json ]
 exec 3<&-
 "$guard" lock
 locked .env && locked .secrets/key && locked .env.manual || exit 1
@@ -693,6 +706,7 @@ printf '%s\n' "$api" > "$rules/.indexingfolders"
 reject_scope lock
 reject_scope config reset
 expect_no_reset "$guard session"
+expect_no_reset "$guard unlock service-api"
 [ ! -e "$api/taken-over" ] && opened "$api/.env" && opened "$api/child/.env" || exit 1
 # The default scan stops at the ignored project. Its command can run beside
 # the live project and closing it must preserve access inside that project.
@@ -715,9 +729,10 @@ opened "$web/.env" && opened "$web/moved-api/.env" || exit 1
 mv "$web/moved-api" "$api"
 "$guard" status > all-open.out
 grep -F 'service-api' all-open.out >/dev/null
-grep -F 'service-web' all-open.out >/dev/null
+if grep -F 'service-web' all-open.out >/dev/null; then echo 'Listed detached access as a peer session' >&2; exit 1; fi
 "$guard" status service-web > web-open.out
-grep -F 'OPEN / manual' web-open.out >/dev/null
+locked /var/lib/secret-guard/named-service-web/unlocked.json
+[ ! -e /var/lib/secret-guard/named-service-web/session.json ]
 if grep -F "$api/.env" web-open.out >/dev/null; then echo 'Named status included another operation' >&2; exit 1; fi
 
 # Recovery must secure the original scope even after rule edits, beside a live peer.
@@ -750,16 +765,26 @@ if SUDO_UID=2000 "$guard" lock service-web > wrong-user.log 2>&1; then echo 'A d
 locked "$web/.env" && untouched "$web/local/.env" || exit 1
 printf '%s\n' '.env' '.env.*' > "$rules/.indexingsecrets"
 
-# Two admissions that race for the same scope cannot both leave manual access open.
-"$guard" unlock race-a --path "$web" > race-a.log 2>&1 &
+# Two supervisors racing to manage the same directory cannot both start.
+# The winner holds its session until the other process has returned.
+race_command='touch "$1/$2.ready"; while [ ! -f "$1/race.done" ]; do sleep 0.1; done'
+"$guard" session race-a --path "$web" -- sh -eu -c "$race_command" sh "$web" a > race-a.log 2>&1 &
 first=$!
-"$guard" unlock race-b --path "$web" > race-b.log 2>&1 &
+"$guard" session race-b --path "$web" -- sh -eu -c "$race_command" sh "$web" b > race-b.log 2>&1 &
 second=$!
+trap 'touch "$web/race.done"; wait "$first" || :; wait "$second" || :' 0
+for attempt in $(seq 1 100); do
+    if [ -e "$web/a.ready" ] && ! kill -0 "$second" 2>/dev/null; then break; fi
+    if [ -e "$web/b.ready" ] && ! kill -0 "$first" 2>/dev/null; then break; fi
+    sleep 0.1
+done
+opened "$web/.env"
+touch "$web/race.done"
 wins=0
-if wait "$first"; then wins=1; winner=race-a; fi
-if wait "$second"; then wins=$((wins+1)); winner=race-b; fi
-[ "$wins" = 1 ] && opened "$web/.env" || { echo "Overlapping admissions produced $wins winners" >&2; exit 1; }
-"$guard" lock "$winner"
+if wait "$first"; then wins=1; fi
+if wait "$second"; then wins=$((wins+1)); fi
+trap - 0
+[ "$wins" = 1 ] || { echo "Overlapping admissions produced $wins winners" >&2; exit 1; }
 locked "$web/.env" && locked "$api/.env" || exit 1
 
 # An explicit path has its own operation identity. Absolute and relative spellings
@@ -767,9 +792,26 @@ locked "$web/.env" && locked "$api/.env" || exit 1
 (cd "$projects"; "$guard" unlock ./api-extra)
 opened "$web/.env" && locked "$api/.env" && untouched "$web/local/.env" || exit 1
 "$guard" status "$web" > direct-status.out
-grep -F 'OPEN / manual' direct-status.out >/dev/null
-reject_scope lock service-web
-reject_scope unlock another-web --path "$web"
+grep -F "owner-only mode  1000:1000 0600  \"$web/.env\"" direct-status.out >/dev/null
+# A failed unlock under another selector must leave prior manual access intact.
+as_editor sh -eu -c 'umask 022; : > "$1/.env.peer-busy"' sh "$web"
+peer_reader=/var/lib/sg-peer-reader
+install -d -o 2000 -g 2000 -m 0700 "$peer_reader"
+hold_file as_reader "$web/.env.peer-busy" "$peer_reader"
+if setsid --fork --wait "$guard" unlock service-web </dev/null > peer-busy-unlock.log 2>&1; then
+    echo 'Unlocked a public file still open by another UID' >&2; exit 1
+fi
+grep -F "$web/.env.peer-busy" peer-busy-unlock.log >/dev/null
+opened "$web/.env"
+"$guard" status service-web | grep -F 'OPEN / recovery required' >/dev/null
+release_file
+"$guard" lock service-web
+"$guard" lock "$web"
+locked "$web/.env" && locked "$web/.env.peer-busy" || exit 1
+"$guard" unlock "$web"
+"$guard" session service-web -- sh -eu -c 'test -w "$1"' sh "$web/.env"
+locked "$web/.env"
+"$guard" unlock "$web"
 exec 3<"$web/.env"
 if setsid --fork --wait "$guard" lock "$web" 3<&- </dev/null > direct-busy.log 2>&1; then
     echo 'Direct path lock ignored an open descriptor' >&2; exit 1
@@ -826,10 +868,80 @@ if [ "$peer_result" != 0 ]; then cat closing-peer.log >&2; exit "$peer_result"; 
 locked "$web/.env"
 echo 'PASS: absolute and relative excludes, concurrent named and direct sessions, overlap rejection and targeted crash recovery'
 
-# Default project roots can contain a manually opened one-off directory. Only
-# its owner may reset it, and only in an interactive session without a command.
-"$guard" unlock "$api"
+# Stop a real supervisor after its command confirms successful unlock.
+abandon_session() {
+    ready_dir=$1
+    shift
+    rm -f "$ready_dir/abandoned-ready"
+    "$guard" session "$@" -- sh -eu -c 'touch "$1/abandoned-ready"; exec sleep 30' sh "$ready_dir" > abandoned-session.log 2>&1 &
+    abandoned=$!
+    for attempt in $(seq 1 100); do
+        [ -e "$ready_dir/abandoned-ready" ] && break
+        kill -0 "$abandoned" || return 1
+        sleep 0.1
+    done
+    [ -e "$ready_dir/abandoned-ready" ] || { kill "$abandoned"; wait "$abandoned" || :; return 1; }
+    kill -KILL "$abandoned"
+    wait "$abandoned" 2>/dev/null || :
+}
+# A default session started after a detached project unlock respects its
+# configured exclusion on both scans. The project stays open until selected.
 printf '%s\n' "$projects" > "$rules/.indexingfolders"
+cp "$rules/.indexingignore" pre-detach-ignores
+printf '%s\n' "$api/" "$web/local/" >> "$rules/.indexingignore"
+"$guard" unlock "$api"
+"$guard" session -- sh -eu -c 'test -w "$1" && test -w "$2"' sh "$api/.env" "$web/.env"
+opened "$api/.env" && locked "$web/.env" || exit 1
+"$guard" lock "$api"
+locked "$api/.env"
+cp pre-detach-ignores "$rules/.indexingignore"
+
+# A stale selected project requires confirmation before detaching. A different
+# selection, another UID, a headless caller and a declined prompt preserve it.
+abandon_session "$api" "$api"
+expect_no_reset "$guard unlock"
+expect_no_reset "SUDO_UID=2000 $guard unlock \"$api\""
+if setsid --fork --wait "$guard" unlock "$api" </dev/null > headless-unlock.log 2>&1; then
+    echo 'Detached a stale session without a terminal' >&2; exit 1
+fi
+result=0
+printf '\n' | SHELL=/bin/sh timeout 5 script -eqfc "$guard unlock \"$api\"" /dev/null > declined-unlock.log || result=$?
+[ "$result" = 1 ] && opened "$api/.env" || exit 1
+grep -F '[y/N]' declined-unlock.log >/dev/null
+"$guard" status "$api" | grep -F 'OPEN / recovery required' >/dev/null
+# A private descriptor held by the owner would prevent lock. Unlock must succeed
+# without that intermediate transition and use the stale session's saved rules.
+cp "$rules/.indexingsecrets" before-stale-unlock
+printf '%s\n' 'never-selected' > "$rules/.indexingsecrets"
+exec 3<"$api/.env"
+printf 'yes\n' | SHELL=/bin/sh timeout 5 script -eqfc "$guard unlock \"$api\"" /dev/null 3<&- > confirmed-unlock.log
+exec 3<&-
+grep -F '[y/N]' confirmed-unlock.log >/dev/null
+grep -F UNLOCKED confirmed-unlock.log >/dev/null
+"$guard" status "$api" | grep -Fx 'No open session.' >/dev/null
+opened "$api/.env" && opened "$api/child/.env" || exit 1
+"$guard" lock "$api"
+locked "$api/.env" && locked "$api/child/.env" || exit 1
+cp before-stale-unlock "$rules/.indexingsecrets"
+
+# Detaching an interrupted session keeps any older manual scope for this
+# selection. The next explicit lock must cover both even after rule edits.
+as_editor sh -eu -c 'umask 077; : > "$1/prior.token"' sh "$api"
+printf '%s\n' 'prior.token' > "$rules/.indexingsecrets"
+"$guard" lock "$api"
+"$guard" unlock "$api"
+cp before-stale-unlock "$rules/.indexingsecrets"
+abandon_session "$api" "$api"
+printf '%s\n' 'unused.fixture' > "$rules/.indexingsecrets"
+printf 'y\n' | SHELL=/bin/sh timeout 5 script -eqfc "$guard unlock \"$api\"" /dev/null > detach-multiple.log
+opened "$api/prior.token" && opened "$api/.env" && opened "$api/child/.env" || exit 1
+"$guard" lock "$api"
+locked "$api/prior.token" && locked "$api/.env" && locked "$api/child/.env" || exit 1
+cp before-stale-unlock "$rules/.indexingsecrets"
+
+# Default project roots can contain an abandoned one-off session. Its owner
+# may recover it interactively before opening the default session.
+abandon_session "$api" "$api"
 expect_no_reset "SUDO_UID=2000 $guard session"
 expect_no_reset "$guard session -- touch unexpected-work-command"
 [ ! -e unexpected-work-command ]
@@ -844,9 +956,9 @@ printf '\n' | SHELL=/bin/sh timeout 5 script -eqfc "$guard session" /dev/null > 
 [ "$result" -eq 1 ] && opened "$api/.env" && locked "$web/.env" || exit 1
 grep -F '[y/N]' declined-reset.log >/dev/null
 grep -F "$api" declined-reset.log >/dev/null
-expect_tone 'manually unlocked' 33 declined-reset.log
+expect_tone 'awaiting recovery' 33 declined-reset.log
 expect_tone 'Error' 31 declined-reset.log
-"$guard" status "$api" | grep -F 'OPEN / manual' >/dev/null
+"$guard" status "$api" | grep -F 'OPEN / recovery required' >/dev/null
 [ ! -e /var/lib/secret-guard/session.json ]
 
 # An answer applies to the journal displayed in the prompt. Closing and
@@ -855,13 +967,13 @@ result=0
 (
     wait_for_text '[y/N]' replaced-reset.log || exit 1
     timeout 3 "$guard" lock "$api" >/dev/null || exit 1
-    timeout 3 "$guard" unlock "$api" >/dev/null || exit 1
+    abandon_session "$api" "$api" || exit 1
     touch reset-target-replaced
     printf 'yes\n\n'
-) | SHELL=/bin/sh timeout 15 script -eqfc "$guard session" /dev/null > replaced-reset.log || result=$?
+) | SHELL=/bin/sh timeout 15 script -eqfc "$guard unlock \"$api\"" /dev/null > replaced-reset.log || result=$?
 [ "$result" -eq 1 ] && [ -e reset-target-replaced ] || exit 1
 opened "$api/.env" && locked "$web/.env" || exit 1
-"$guard" status "$api" | grep -F 'OPEN / manual' >/dev/null
+"$guard" status "$api" | grep -F 'OPEN / recovery required' >/dev/null
 [ ! -e /var/lib/secret-guard/session.json ]
 
 # A yes response completes the old close, then starts the requested selection.
@@ -884,6 +996,21 @@ grep -F 'Reset' recover-overlap.log >/dev/null
 grep -F "$api" recover-overlap.log >/dev/null
 locked "$projects/.env.fresh" && locked "$api/.env" && locked "$web/.env" || exit 1
 "$guard" status "$api" | grep -F 'No open session.' >/dev/null
+# Default recovery closes the saved project before the replacement session
+# applies a valid edit to the configured roots.
+printf '%s\n' "$api" > "$rules/.indexingfolders"
+cp before-stale-unlock "$rules/.indexingsecrets"
+abandon_session "$api"
+printf '%s\n' "$web" > "$rules/.indexingfolders"
+(
+    wait_for_text '[y/N]' recover-default.log || exit 1
+    printf 'yes\n'
+    wait_for_text 'Press Enter to lock.' recover-default.log || exit 1
+    locked "$api/.env" && opened "$web/.env" || exit 1
+    touch default-reset-verified
+    printf '\n'
+) | SHELL=/bin/sh timeout 15 script -eqfc "$guard session" /dev/null > recover-default.log
+[ -e default-reset-verified ] && locked "$api/.env" && locked "$web/.env" || exit 1
 echo 'PASS: foreground reset choices, saved-scope close, and supervised, cross-UID and unattended refusals'
 
 # A directory selected explicitly can be inside an ignored tree. Independent
@@ -980,7 +1107,10 @@ untouched "$physical/.env"
 (umask 077; printf '{"version":3,"phase":"manual","user":"editor","uid":1000,"pid":1,"scope":{"roots":["%s","%s"],"patterns":[".env"],"ignores":[]},"roots":[[%s],[%s]]}\n' \
     "$physical" "$alias_dir" "$(stat -c '%d,%i' "$physical")" "$(stat -c '%d,%i' "$alias_dir")" \
     > /var/lib/secret-guard/session.json)
+# Version 1.0.0 kept completed manual unlocks in the supervisor journal.
+"$guard" status | grep -Fx 'No open session.' >/dev/null
 "$guard" unlock
+[ ! -e /var/lib/secret-guard/session.json ] && locked /var/lib/secret-guard/unlocked.json || exit 1
 opened "$physical/.env"
 "$guard" lock
 locked "$physical/.env"

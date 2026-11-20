@@ -85,16 +85,6 @@ pub(super) fn describe(
         };
     };
 
-    if session.is_manual_open() {
-        return writeln!(
-            out,
-            "{} (user {:?}, UID {})",
-            palette.paint(Tone::Open, "OPEN / manual"),
-            session.user,
-            session.uid
-        );
-    }
-
     let (activity, tone) = if idle {
         ("OPEN / recovery required", Tone::Warning)
     } else {

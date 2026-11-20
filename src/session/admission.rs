@@ -1,14 +1,16 @@
 //! Inspect open sessions under the admission lock and detect conflicting requests.
 
 use std::{
-    ffi::OsString,
     fs::File,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, ensure};
 
-use super::selection::{Selection, Slot};
+use super::{
+    operation::Mutation,
+    selection::{Selection, Slot},
+};
 use crate::{
     journal::{JournalStore, Session},
     tree::{Tree, overlap},
@@ -17,17 +19,29 @@ use crate::{
 pub(crate) struct Entry {
     pub slot: Slot,
     pub session: Option<Session>,
+    pub receipts: Vec<Session>,
     pub idle: bool,
 }
 
 impl Entry {
+    pub fn occupies_slot(&self) -> bool {
+        !self.idle || self.session.is_some()
+    }
+
     pub fn root(&self) -> Option<&Path> {
         self.session
-            .as_ref()?
+            .as_ref()
+            .or_else(|| self.receipts.last())?
             .scope()
             .roots
             .first()
             .map(PathBuf::as_path)
+    }
+
+    pub fn has_receipt_at(&self, path: &Path) -> bool {
+        self.receipts
+            .iter()
+            .any(|r| r.scope().roots.iter().any(|root| root == path))
     }
 }
 
@@ -44,13 +58,22 @@ pub(crate) fn operations(registry: &JournalStore) -> Result<Vec<Entry>> {
             .open(registry, false)?
             .context("session state disappeared")?;
         let idle = store.try_exclusive()?;
-        let session = store.load()?;
+        let mut session = store.load::<Session>()?;
+        let mut receipts = store.receipts()?;
+        // Version 1.0.0 stored a completed unlock in session.json. Reading
+        // status must also work before any command migrates that slot.
+        if idle && let Some(completed) = session.take_if(|s| s.is_manual_open()) {
+            completed.validate_receipt()?;
+            receipts.retain(|r| !r.same_selection(&completed));
+            receipts.push(completed);
+        }
 
-        if !idle || session.is_some() {
+        if !idle || session.is_some() || !receipts.is_empty() {
             entries.push(Entry {
                 slot,
                 idle,
                 session,
+                receipts,
             });
         }
     }
@@ -72,7 +95,7 @@ fn conflicts<'a>(
     let mut conflicts = Vec::new();
     for entry in entries
         .iter()
-        .filter(|entry| starting_session || entry.slot != *selected)
+        .filter(|entry| entry.occupies_slot() && (starting_session || entry.slot != *selected))
     {
         let label = entry.slot.label(entry.root());
         let session = entry.session.as_ref().with_context(|| {
@@ -80,11 +103,7 @@ fn conflicts<'a>(
         })?;
 
         let reason = if entry.slot == *selected {
-            if session.is_manual_open() {
-                "files are manually unlocked".into()
-            } else {
-                "an unfinished operation was found".into()
-            }
+            "an unfinished operation was found".into()
         } else {
             let Some((requested, open)) = overlap::overlapping_roots(
                 tree,
@@ -122,7 +141,6 @@ pub(super) struct ResetOffer {
     pub journal: File,
     pub label: String,
     pub roots: Vec<PathBuf>,
-    pub kind: &'static str,
     pub close_hint: String,
 }
 
@@ -132,9 +150,11 @@ pub(super) fn reset_offer(
     selected: &Slot,
     tree: &Tree,
     uid: u32,
-    command: Option<&[OsString]>,
+    request: Mutation<'_>,
+    approved: bool,
 ) -> Result<Option<ResetOffer>> {
-    let conflicts = conflicts(entries, selected, tree, command.is_some())?;
+    let include_selected = !approved && !matches!(request, Mutation::Lock);
+    let conflicts = conflicts(entries, selected, tree, include_selected)?;
 
     // Check all blockers before offering to close any of them. A live or foreign
     // session still prevents the request even if a different journal is recoverable.
@@ -152,7 +172,8 @@ pub(super) fn reset_offer(
             conflict.session.uid
         );
         ensure!(
-            command.is_some_and(<[OsString]>::is_empty),
+            matches!(request, Mutation::Session([]))
+                || (matches!(request, Mutation::Unlock) && entry.slot == *selected),
             "{}. {}",
             conflict.reason,
             entry.slot.close_hint(entry.root())
@@ -173,11 +194,6 @@ pub(super) fn reset_offer(
         label: entry.slot.title(),
         roots: conflict.session.scope().roots.clone(),
         journal: store.pin_session()?,
-        kind: if conflict.session.is_manual_open() {
-            "manually unlocked"
-        } else {
-            "awaiting recovery"
-        },
         close_hint: entry.slot.close_hint(entry.root()),
     }))
 }

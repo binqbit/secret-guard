@@ -49,6 +49,19 @@ impl Session {
         matches!(self.phase, Phase::Manual)
     }
 
+    pub(crate) fn validate_receipt(&self) -> Result<()> {
+        ensure!(
+            self.version == 3,
+            "unsupported manual unlock record version"
+        );
+        ensure!(self.is_manual_open(), "manual unlock has not completed");
+        Ok(())
+    }
+
+    pub(crate) fn same_selection(&self, other: &Self) -> bool {
+        self.uid == other.uid && self.roots == other.roots && self.scope == other.scope
+    }
+
     pub(crate) fn start(
         store: &JournalStore,
         tree: &Tree,

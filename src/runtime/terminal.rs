@@ -15,13 +15,16 @@ pub fn check_interactive() -> Result<()> {
     Ok(())
 }
 
-pub fn confirm_session_reset(label: &str, kind: &str, roots: &[PathBuf]) -> Result<bool> {
-    let Some(mut tty) = foreground_terminal()? else {
-        return Ok(false);
-    };
+pub fn confirm_session_reset(label: &str, roots: &[PathBuf], action: &str) -> Result<bool> {
+    let mut tty =
+        foreground_terminal()?.context("reset requires confirmation in a foreground terminal")?;
 
     let palette = Palette::for_stream(&tty);
-    writeln!(tty, "{label} is {}.", palette.paint(Tone::Warning, kind))?;
+    writeln!(
+        tty,
+        "{label} is {}.",
+        palette.paint(Tone::Warning, "awaiting recovery")
+    )?;
     for root in roots {
         writeln!(tty, "  {root:?}")?;
     }
@@ -30,11 +33,7 @@ pub fn confirm_session_reset(label: &str, kind: &str, roots: &[PathBuf]) -> Resu
         tty,
         "Enter keeps this session open and cancels the new request."
     )?;
-    write!(
-        tty,
-        "Reset this session by locking its files, then continue? {} ",
-        palette.paint(Tone::Action, "[y/N]")
-    )?;
+    write!(tty, "{action} {} ", palette.paint(Tone::Action, "[y/N]"))?;
     tty.flush()?;
     read_confirmation(&mut tty)
 }
