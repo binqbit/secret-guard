@@ -304,7 +304,19 @@ impl ConfigFiles {
             match list {
                 RuleList::Folders => scope.roots = entries.into_iter().map(Into::into).collect(),
                 RuleList::Secrets => scope.patterns = entries,
-                RuleList::Ignore => scope.ignores = entries,
+                RuleList::Ignore => {
+                    if let Some(root) = root {
+                        // Save the effective rules so closing this session reuses the
+                        // selection it opened, even after an upgrade or configuration edit.
+                        for entry in entries {
+                            if !IgnoreRule::compile(&entry)?.excludes_root(root) {
+                                scope.ignores.push(entry);
+                            }
+                        }
+                    } else {
+                        scope.ignores = entries;
+                    }
+                }
             }
         }
         Ok(scope)

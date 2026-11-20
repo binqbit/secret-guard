@@ -698,4 +698,56 @@ trap - 0
 if [ "$peer_result" != 0 ]; then cat closing-peer.log >&2; exit "$peer_result"; fi
 locked "$web/.env"
 echo 'PASS: absolute and relative excludes, concurrent named and direct sessions, overlap rejection and targeted crash recovery'
+
+# A directory selected explicitly can be inside an ignored tree. Independent
+# exclusions within the selected directory still apply, as do the secret rules.
+parent="$projects/omitted"
+selected="$parent/app"
+nested_file="$selected/src/config/.env"
+install -d -o 1000 -g 1000 -m 0755 "$selected" "$selected/fixtures" "$selected/generated" "$selected/app" \
+    "$selected/src/config"
+for file in "$selected/.env" "$selected/.env.example" "$selected/fixtures/.env" \
+    "$selected/generated/.env" "$selected/app/.env" "$selected/public.txt" "$nested_file"; do
+    as_editor sh -c 'umask 027; : > "$1"' sh "$file"
+done
+printf '%s\n' "$parent" > "$rules/.indexingfolders"
+printf '%s\n' '.env' '.env.*' > "$rules/.indexingsecrets"
+printf '%s\n' "$parent/" "$selected" './' './fixtures/' "$selected/generated/" 'app/' '.env.example' > "$rules/.indexingignore"
+"$guard" status --paths > default-selection.out
+cmp default-selection.out /dev/null
+"$guard" lock
+untouched "$selected/.env" && untouched "$nested_file" || exit 1
+printf '"%s"\n' "$selected/.env" "$nested_file" > expected-subsession.out
+"$guard" status "$selected" --paths | cmp - expected-subsession.out
+"$guard" lock priority --path "$selected"
+locked "$selected/.env" && locked "$nested_file" || exit 1
+"$guard" status priority --paths | cmp - expected-subsession.out
+"$guard" unlock priority
+opened "$selected/.env" && opened "$nested_file" || exit 1
+printf '%s\n' "$selected/.env" >> "$rules/.indexingignore"
+printf '"%s"\n' "$nested_file" > edited-selection.out
+"$guard" status priority --paths | cmp - edited-selection.out
+"$guard" status priority | grep -F "owner-only mode  1000:1000 0600  \"$selected/.env\"" >/dev/null
+"$guard" lock priority
+locked "$selected/.env" && locked "$nested_file" || exit 1
+untouched "$selected/.env.example" && untouched "$selected/fixtures/.env" \
+    && untouched "$selected/generated/.env" && untouched "$selected/app/.env" \
+    && untouched "$selected/public.txt" || exit 1
+
+# Earlier releases journaled the unmodified ignore list, so an old session
+# that selected nothing must retain that selection throughout recovery.
+as_editor sh -c 'umask 027; : > "$1"' sh "$selected/.env.deferred"
+journal=/var/lib/secret-guard/named-priority/session.json
+(umask 077; printf '{"version":3,"phase":"running","user":"editor","uid":1000,"pid":1,"scope":{"roots":["%s"],"patterns":[".env.*"],"ignores":["%s/"]},"roots":[[%s]]}\n' \
+    "$selected" "$parent" "$(stat -c '%d,%i' "$selected")" > "$journal")
+"$guard" status priority > prior-selection.out
+grep -F 'OPEN / recovery required' prior-selection.out >/dev/null
+if grep -F "$selected/.env.deferred" prior-selection.out >/dev/null; then
+    echo 'An existing session adopted the new root precedence during recovery' >&2; exit 1
+fi
+"$guard" lock priority
+untouched "$selected/.env.deferred"
+"$guard" session "$selected" -- /bin/sh -ec 'test -w "$1"' sh "$selected/.env.deferred"
+locked "$selected/.env.deferred"
+echo 'PASS: explicit root precedence, inner exclusions, saved selection and earlier journal recovery'
 GUEST

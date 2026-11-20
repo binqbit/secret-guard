@@ -366,6 +366,10 @@ impl IgnoreRule {
         Ok(Self::Pattern(Rule::compile(entry)?))
     }
 
+    pub(crate) fn excludes_root(&self, root: &Path) -> bool {
+        self.excludes(root, Path::new(""), true)
+    }
+
     fn excludes(&self, absolute: &Path, relative: &Path, is_directory: bool) -> bool {
         match self {
             Self::Exact {
@@ -499,7 +503,11 @@ impl Tree {
         let mut result = BTreeMap::new();
         for root in &self.roots {
             check_root(root)?;
-            if self.excluded(&root.path, Path::new(""), true) {
+            if self
+                .ignores
+                .iter()
+                .any(|rule| rule.excludes_root(&root.path))
+            {
                 continue;
             }
             let mut dirs = vec![PathBuf::new()];

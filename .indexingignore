@@ -1,4 +1,5 @@
-# Secret Guard skips these directories at any depth.
+# Skip directories with these names inside each search root.
+# An explicitly selected session starts inside its directory and applies these rules to its contents.
 .git/
 target/
 node_modules/

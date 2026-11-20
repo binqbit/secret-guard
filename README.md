@@ -40,7 +40,7 @@ For example, with `/home/alice` as the search root, the default rules manage `/h
 | --- | --- | --- |
 | [.indexingfolders](.indexingfolders) | Absolute directories for the default session. A named or directory session selects one directory of its own. | `/srv/work/api`, `/srv/work/web` |
 | [.indexingsecrets](.indexingsecrets) | Names or glob patterns of files to protect. A directory rule protects its contents recursively. | `.env`, `.env.*`, `.secrets/` |
-| [.indexingignore](.indexingignore) | Files to skip and directories to skip entirely. An ignore rule wins over a secret rule. | `.git/`, `target/`, `node_modules/`, `.env.example`, `.env.*.example` |
+| [.indexingignore](.indexingignore) | Files to skip and directories to skip entirely. Within a scanned root, exclusions take precedence over secret rules. | `.git/`, `target/`, `node_modules/`, `.env.example`, `.env.*.example` |
 
 To choose your editor for one edit, pass `--editor`. For example, either command opens the selected list in the same terminal.
 
@@ -138,6 +138,10 @@ Here `alice` stands for your login name. For a project with an executable test s
 ### Named and directory sessions
 
 `session`, `unlock`, `lock` and `status` accept the same optional selector. Omitting it operates on the default roots in `.indexingfolders`. A name or a directory selects one project and applies the installed `.indexingsecrets` and `.indexingignore` to it. The project may lie outside the default roots.
+
+An explicitly selected directory takes precedence over an exclusion of that directory or one of its parents. For example, if `.indexingignore` lists both `/srv/work/` and `/srv/work/api/fixtures/`, a default scan skips `/srv/work/`. Running `sudo secret-guard session /srv/work/api` selects matching secrets in `api` and still skips `api/fixtures/`. A saved session name for `/srv/work/api` uses the same selection. Preview it with `sudo secret-guard status /srv/work/api --paths`.
+
+This also applies when a directory name repeats. With `target/` in the ignore list, `session /srv/work/target` can select `/srv/work/target/src/.env`. It still skips `/srv/work/target/target/.env` because the inner `target/` matches the rule.
 
 To save a name, give the directory on the first `session`, `unlock` or `lock`. The example below previews the selection, opens an interactive session, then reuses the name for manual access after that session closes.
 
