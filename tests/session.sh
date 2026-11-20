@@ -26,15 +26,17 @@ root:x:0:0:Root:/root:/bin/sh
 editor:x:1000:1000:Editor:/var/lib/editor home:/bin/sh
 reader:x:2000:2000:Reader:/var/lib/reader home:/bin/sh
 ACCOUNTS
-printf '%s\n' 'root:x:0:' 'editor:x:1000:' 'reader:x:2000:' > /etc/group
+printf '%s\n' 'root:x:0:' 'editor:x:1000:' 'reader:x:2000:' 'shared:x:3000:editor' > /etc/group
 printf '%s\n' 'passwd: files' 'group: files' > /etc/nsswitch.conf
 
 work=/var/lib/sg-test-work
 rules=/etc/secret-guard
 as_reader() { setpriv --reuid=2000 --regid=2000 --clear-groups "$@"; }
+as_editor() { setpriv --reuid=1000 --regid=1000 --groups=3000 "$@"; }
+locked() { [ "$(stat -c '%u:%g:%a' "$1")" = '0:0:600' ]; }
 editor_home='/var/lib/editor home'
 reader_home='/var/lib/reader home'
-install -d -o 1000 -g 1000 -m 0755 "$editor_home"
+install -d -o 1000 -g 1000 -m 0700 "$editor_home"
 install -d -o 2000 -g 2000 -m 0755 "$reader_home"
 # Give both ordinary accounts access to the binary even if the build directory is private.
 install -m 0755 "$guard" /var/lib/sg-test-cli
@@ -141,6 +143,75 @@ done
 [ "$(cat "$rules/local-settings/note")" = 'keep this too' ]
 [ "$(stat -c '%d:%i:%u:%g:%a' "$editor_home/.env")" = "$before_reset" ]
 [ "$(cat "$editor_home/.env")" = 'bootstrap fixture' ]
+
+# Opening the default home keeps its existing traversal restrictions.
+home_env="$editor_home/.env"
+"$guard" lock
+(
+    for attempt in $(seq 1 100); do
+        if grep -F 'Press Enter to lock.' private-tty.log >/dev/null 2>&1; then
+            [ "$(as_editor cat "$home_env")" = 'bootstrap fixture' ] || exit 1
+            touch private-tty-enter
+            printf '\n'
+            exit 0
+        fi
+        sleep 0.1
+    done
+    exit 1
+) | SHELL=/bin/sh timeout 15 script -eqfc "$guard session" /dev/null > private-tty.log
+[ -e private-tty-enter ]
+grep -F "$(printf '\033[32mUNLOCKED\033[0m')" private-tty.log >/dev/null
+grep -F "$(printf '\033[31mLOCKED\033[0m')" private-tty.log >/dev/null
+locked "$home_env"
+"$guard" session -- /bin/sh -eu -c '
+    [ "$(stat -c %a "$HOME")" = 700 ]
+    [ "$(stat -c "%u:%g:%a" "$HOME/.env")" = 1000:1000:644 ]
+    [ "$(cat "$HOME/.env")" = "bootstrap fixture" ]
+    printf "%s\n" "private session edit" > "$HOME/.env"
+'
+locked "$home_env"
+if as_editor cat "$home_env" >/dev/null 2>&1; then echo 'Home secret still readable after session' >&2; exit 1; fi
+"$guard" unlock
+[ "$(as_editor cat "$home_env")" = 'private session edit' ]
+[ "$(stat -c '%u:%g:%a' "$home_env")" = '1000:1000:644' ]
+[ "$(stat -c '%u:%g:%a' "$editor_home")" = '1000:1000:700' ]
+if as_reader cat "$home_env" >/dev/null 2>&1; then echo 'Another UID traversed the private home' >&2; exit 1; fi
+"$guard" lock
+locked "$home_env"
+if as_editor cat "$home_env" >/dev/null 2>&1; then echo 'Home secret still readable after manual lock' >&2; exit 1; fi
+[ "$(stat -c '%u:%g:%a' "$editor_home")" = '1000:1000:700' ]
+
+# File ownership alone does not grant traversal. Preflight must leave even an
+# eligible, unenrolled sibling unchanged when the selected user cannot enter.
+foreign_dir="$editor_home/other-owner"
+install -d -o 2000 -g 3000 -m 0700 "$foreign_dir"
+printf '%s\n' 'traversal fixture' > "$foreign_dir/.env"
+touch "$editor_home/.env.sibling"
+chown 1000:1000 "$foreign_dir/.env" "$editor_home/.env.sibling"
+chmod 0600 "$foreign_dir/.env" "$editor_home/.env.sibling"
+if "$guard" unlock > traversal.log 2>&1; then echo 'Unlocked through an inaccessible directory' >&2; exit 1; fi
+grep -F "$foreign_dir" traversal.log >/dev/null
+[ ! -e /var/lib/secret-guard/session.json ]
+[ "$(stat -c '%u:%g:%a' "$editor_home/.env.sibling")" = '1000:1000:600' ]
+[ "$(stat -c '%u:%g:%a' "$foreign_dir/.env")" = '1000:1000:600' ]
+locked "$home_env"
+
+# A supplementary group can grant search permission without directory listing.
+chmod 0710 "$foreign_dir"
+"$guard" session -- grep -Fx 'traversal fixture' "$foreign_dir/.env" >/dev/null
+locked "$foreign_dir/.env"
+if command -v setfacl >/dev/null 2>&1; then
+    # A named user denial takes precedence over group search permission.
+    setfacl -m u:1000:--- "$foreign_dir"
+    if "$guard" unlock > traversal.log 2>&1; then echo 'Ignored a named ACL denial' >&2; exit 1; fi
+    grep -F "$foreign_dir" traversal.log >/dev/null
+    [ ! -e /var/lib/secret-guard/session.json ]
+    locked "$foreign_dir/.env"
+    setfacl -m u:1000:--x,g::--- "$foreign_dir"
+    "$guard" session -- grep -Fx 'traversal fixture' "$foreign_dir/.env" >/dev/null
+    locked "$foreign_dir/.env"
+fi
+echo 'PASS: private home, user-specific traversal, and root-only closure'
 mv /var/lib/secret-guard /var/lib/first-status-state
 
 printf '%s\n' "$work" > "$rules/.indexingfolders"
@@ -265,7 +336,6 @@ if command -v setfacl >/dev/null 2>&1; then
     echo 'PASS: rule file, directory and ancestor ACL checks'
 fi
 
-locked() { [ "$(stat -c '%u:%g:%a' "$1")" = '0:0:600' ]; }
 "$guard" lock
 locked .env && locked .secrets/key || exit 1
 if as_reader cat .env >/dev/null 2>&1; then echo 'Locked file is readable' >&2; exit 1; fi

@@ -2,12 +2,13 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
+use rustix::fs::Access;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     Scope,
     journal::JournalStore,
-    runtime::{SessionSignals, User},
+    runtime::{self, SessionSignals, User},
     tree::{Change, FileAccess, Tree},
 };
 
@@ -123,8 +124,8 @@ pub fn preflight(tree: &Tree, user: &User) -> Result<BTreeMap<PathBuf, FileAcces
         access
             .validate_open(user.uid)
             .with_context(|| format!("cannot open {path:?}"))?;
-        tree.check_public_parents(path)?;
     }
+    runtime::check_file_access(user, &files, Access::EXISTS)?;
     Ok(files)
 }
 
@@ -150,9 +151,8 @@ pub fn open_files(
             access.is_public(user.uid, user.gid),
             "file appeared or changed during session opening: {path:?}"
         );
-        tree.check_public_parents(path)?;
     }
-    Ok(())
+    runtime::check_file_access(user, &current, Access::READ_OK | Access::WRITE_OK)
 }
 
 /// Closing starts with a fresh scan so new files and editor replacements get locked too.

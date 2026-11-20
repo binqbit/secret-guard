@@ -147,7 +147,7 @@ pub(crate) fn acl_allows_public_read(fd: &File) -> Result<bool> {
 pub(crate) fn check_directory_search(fd: &File, dir: &Path) -> Result<()> {
     ensure!(
         fd.metadata()?.mode() & 0o111 == 0o111,
-        "directory {dir:?} needs search permission for owner, group, and others to make the file publicly readable"
+        "directory {dir:?} needs search permission for owner, group, and others to make the configuration lists publicly readable"
     );
     ensure!(
         access_acl(fd)?.is_none_or(|acl| acl.all_can_search),
@@ -490,20 +490,6 @@ impl Tree {
         Ok(result)
     }
 
-    /// Verify search permission along the full path without changing directories.
-    pub fn check_public_parents(&self, path: &Path) -> Result<()> {
-        let (root, _) = self.locate(path)?;
-        check_root(root)?;
-        for dir in path.ancestors().skip(1) {
-            let fd = File::from(
-                fs::openat2(fs::CWD, dir, DIR, Mode::empty(), ResolveFlags::NO_SYMLINKS)
-                    .with_context(|| format!("inspect parent {dir:?}"))?,
-            );
-            check_directory_search(&fd, dir)?;
-        }
-        Ok(())
-    }
-
     pub fn set_access(
         &self,
         path: &Path,
@@ -526,7 +512,6 @@ impl Tree {
         before.validate(self.uid)?;
         if open {
             before.validate_open(self.uid)?;
-            self.check_public_parents(path)?;
         }
         let verify_name = |expected_uid: u32| -> Result<()> {
             check_root(root)?;
@@ -679,14 +664,12 @@ mod tests {
     }
 
     #[test]
-    fn private_parent_is_reported_without_changing_it() -> Result<()> {
+    fn public_configuration_requires_searchable_directories() -> Result<()> {
         let root = tempfile::tempdir()?;
         let private = root.path().join("private");
         disk::create_dir(&private)?;
         disk::set_permissions(&private, disk::Permissions::from_mode(0o700))?;
-        let error = tree(root.path())
-            .check_public_parents(&private.join(".env"))
-            .unwrap_err();
+        let error = check_directory_search(&File::open(&private)?, &private).unwrap_err();
         assert!(error.to_string().contains("private"));
         assert_eq!(disk::metadata(private)?.mode() & 0o777, 0o700);
         Ok(())

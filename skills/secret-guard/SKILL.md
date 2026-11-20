@@ -12,12 +12,12 @@ description: Use when storing local credentials, wiring applications to secret f
 
 ## Working with Secret Guard
 
-Read the installed rules in `/etc/secret-guard/` without sudo. Repository copies are templates. The path must lie under a root in `.indexingfolders` and match `.indexingsecrets` (typically `.secrets/`). Exclusions in `.indexingignore` take precedence. Scans skip symlinks and nested mounts. Report missing rules or uncovered paths before relying on Secret Guard.
+Read the installed rules in `/etc/secret-guard/` without sudo. Repository copies are templates. The path must lie under a root in `.indexingfolders` and match `.indexingsecrets` (typically `.secrets/`). Exclusions in `.indexingignore` take precedence. A search root can be shared. On first use, the file must belong to the opening user, who must be able to traverse the path. Scans skip symlinks and nested mounts. Report missing rules or uncovered paths before relying on Secret Guard.
 
 | File | Can read | Can write |
 | --- | --- | --- |
 | Installed rule list (`root:root 0644`) | All local users | Root |
 | Locked (`root:root 0600`) | Root | Root |
-| Unlocked (`0644`) | All local users | Opening user and root |
+| Unlocked (opening user's UID and primary group, `0644`) | Root and users who can traverse the path | Opening user and root |
 
-Wait for `UNLOCKED` from an authorized `session` or manual `unlock` before using a locked secret. Access it as the working user without sudo. Check `test -r "$path"` for reads or `test -w "$path"` for edits without printing the value. Release your file handles when finished. Close a manual unlock with `sudo secret-guard lock` as the opening user and confirm `LOCKED`.
+Wait for `UNLOCKED` from an authorized `session` or manual `unlock`. Work as the opening user without sudo. Unlock preserves directory permissions, including `0700` on the opening user's home. Check `test -r "$path"` for reads or `test -w "$path"` for edits without printing the value. Release your file handles when finished. Close a manual unlock with `sudo secret-guard lock` as the opening user and confirm `LOCKED`.

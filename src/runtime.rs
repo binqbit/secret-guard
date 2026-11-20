@@ -1,13 +1,17 @@
+use crate::tree::FileAccess;
 use anyhow::{Context, Result, anyhow, ensure};
 use nix::unistd::{Uid, User as Account, getgrouplist};
+use rustix::fs::{self, Access, AtFlags, Mode, OFlags, ResolveFlags};
+use std::collections::BTreeMap;
 use std::env;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::process::CommandExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -349,6 +353,127 @@ fn child_setup(
     Ok(())
 }
 
+fn inherited_descriptors() -> Result<Vec<RawFd>> {
+    std::fs::read_dir("/proc/self/fd")?
+        .map(|entry| -> Result<RawFd> {
+            Ok(entry?
+                .file_name()
+                .to_str()
+                .context("invalid proc fd")?
+                .parse()?)
+        })
+        .collect()
+}
+
+fn probe_file(
+    path: &CStr,
+    expected: &FileAccess,
+    access: Access,
+    slot: RawFd,
+    slot_path: &CStr,
+) -> io::Result<()> {
+    let pinned = fs::openat2(
+        fs::CWD,
+        path,
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    )?;
+    let stat = fs::fstat(&pinned)?;
+    if (stat.st_dev, stat.st_ino) != (expected.dev, expected.ino) {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+    }
+    if access != Access::EXISTS {
+        // Probe the pinned inode without opening its contents or affecting file leases.
+        // The procfd path also works on Linux 5.6, before faccessat2(AT_EMPTY_PATH).
+        checked(unsafe { libc::dup2(pinned.as_raw_fd(), slot) })?;
+        fs::accessat(fs::CWD, slot_path, access, AtFlags::empty())?;
+    }
+    Ok(())
+}
+
+pub fn check_file_access(
+    user: &User,
+    files: &BTreeMap<PathBuf, FileAccess>,
+    access: Access,
+) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let targets = files
+        .iter()
+        .map(|(path, expected)| Ok((CString::new(path.as_os_str().as_bytes())?, expected)))
+        .collect::<Result<Vec<_>>>()?;
+    let (mut reader, mut writer) = io::pipe()?;
+    let slot = reader.as_raw_fd();
+    let slot_path = CString::new(format!("/proc/self/fd/{slot}"))?;
+    let descriptors = inherited_descriptors()?;
+    let supervisor = unsafe { libc::getpid() };
+    // Prepare paths before fork. The child uses only syscalls and the error pipe,
+    // and exits without running parent destructors or executing external code.
+    let pid = unsafe { libc::fork() };
+    checked(pid).context("start file access check")?;
+    if pid == 0 {
+        for &fd in &descriptors {
+            if fd != slot && fd != writer.as_raw_fd() {
+                unsafe { libc::close(fd) };
+            }
+        }
+        let mut index = targets.len();
+        let result = child_setup(user, None, &[], supervisor).and_then(|()| {
+            for (i, (path, expected)) in targets.iter().enumerate() {
+                index = i;
+                probe_file(path, expected, access, slot, &slot_path)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            let errno = error.raw_os_error().unwrap_or(libc::EIO);
+            let _ = writer.write_all(&index.to_ne_bytes());
+            let _ = writer.write_all(&errno.to_ne_bytes());
+            unsafe { libc::_exit(1) };
+        }
+        unsafe { libc::_exit(0) };
+    }
+    drop(writer);
+    let mut status = 0;
+    loop {
+        match checked(unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) }) {
+            Ok(()) if libc::WIFSTOPPED(status) => unsafe { libc::kill(pid, libc::SIGKILL) },
+            Ok(()) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                if SIGNAL.load(Ordering::Relaxed) != 0 {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                continue;
+            }
+            Err(error) => return Err(error).context("wait for file access check"),
+        };
+    }
+    let status = ExitStatus::from_raw(status);
+    if status.success() {
+        return Ok(());
+    }
+    ensure!(
+        status.code() == Some(1),
+        "file access check ended with {status}"
+    );
+    let mut index = [0; size_of::<usize>()];
+    let mut errno = [0; size_of::<i32>()];
+    reader.read_exact(&mut index)?;
+    reader.read_exact(&mut errno)?;
+    let error = io::Error::from_raw_os_error(i32::from_ne_bytes(errno));
+    let Some(path) = files.keys().nth(usize::from_ne_bytes(index)) else {
+        return Err(error).with_context(|| format!("check access as UID {}", user.uid));
+    };
+    let permission = if access == Access::EXISTS {
+        "traverse the path to"
+    } else {
+        "read and write"
+    };
+    Err(error).with_context(|| format!("UID {} could not {permission} {path:?}", user.uid))
+}
+
 fn run_command(user: &User, mut cmd: Command, tty: Option<&File>) -> Result<i32> {
     cmd.env_clear()
         .env("HOME", &user.home)
@@ -366,15 +491,7 @@ fn run_command(user: &User, mut cmd: Command, tty: Option<&File>) -> Result<i32>
     }
     // Handle descriptors inherited from sudo as well as files opened by this process.
     // Rust marks the exec-error pipe it creates later close-on-exec itself.
-    let inherited = std::fs::read_dir("/proc/self/fd")?
-        .map(|entry| -> Result<i32> {
-            Ok(entry?
-                .file_name()
-                .to_str()
-                .context("invalid proc fd")?
-                .parse()?)
-        })
-        .collect::<Result<Vec<_>>>()?
+    let inherited = inherited_descriptors()?
         .into_iter()
         .filter(|fd| *fd >= 3)
         .collect::<Vec<_>>();
