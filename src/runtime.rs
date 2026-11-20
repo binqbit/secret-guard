@@ -1,15 +1,17 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use nix::unistd::{Uid, User as Account, getgrouplist};
 use std::env;
-use std::ffi::{CString, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
+
+pub(crate) const COMMAND_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin";
 
 #[derive(Clone)]
 pub struct User {
@@ -138,8 +140,26 @@ impl SessionSignals {
             });
         }
         let tty = foreground_terminal()?;
-        run_command(user, command, tty.as_ref())
+        let mut child = Command::new(&command[0]);
+        child.args(&command[1..]);
+        run_command(user, child, tty.as_ref())
     }
+
+    pub fn run_editor(&self, user: &User, editor: &OsStr, draft: &Path) -> Result<i32> {
+        ensure!(
+            !self.interrupted(),
+            "edit interrupted before starting the editor"
+        );
+        let tty = foreground_terminal()?.context("editing requires a foreground terminal")?;
+        let mut child = Command::new(editor);
+        child
+            .arg(draft)
+            .stdin(tty.try_clone()?)
+            .stdout(tty.try_clone()?)
+            .stderr(tty.try_clone()?);
+        run_command(user, child, Some(&tty))
+    }
+
     pub fn wait_for_retry(&self, busy: &[PathBuf]) -> Result<()> {
         fn list(out: &mut impl Write, busy: &[PathBuf]) -> io::Result<()> {
             writeln!(out, "Files still in use:")?;
@@ -177,8 +197,7 @@ impl Drop for SessionSignals {
 }
 
 pub fn check_interactive() -> Result<()> {
-    foreground_terminal()?
-        .context("interactive sessions require a foreground controlling terminal")?;
+    foreground_terminal()?.context("this command requires a foreground controlling terminal")?;
     Ok(())
 }
 
@@ -330,18 +349,13 @@ fn child_setup(
     Ok(())
 }
 
-fn run_command(user: &User, args: &[OsString], tty: Option<&File>) -> Result<i32> {
-    let mut cmd = Command::new(&args[0]);
-    cmd.args(&args[1..])
-        .env_clear()
+fn run_command(user: &User, mut cmd: Command, tty: Option<&File>) -> Result<i32> {
+    cmd.env_clear()
         .env("HOME", &user.home)
         .env("SHELL", &user.shell)
         .env("USER", &user.name)
         .env("LOGNAME", &user.name)
-        .env(
-            "PATH",
-            "/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin",
-        );
+        .env("PATH", COMMAND_PATH);
     for (key, value) in env::vars_os() {
         if key
             .to_str()

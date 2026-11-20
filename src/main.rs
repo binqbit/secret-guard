@@ -2,6 +2,7 @@
 compile_error!("Secret Guard requires Linux.");
 
 mod config;
+mod editor;
 mod journal;
 mod runtime;
 mod state;
@@ -23,7 +24,7 @@ use tree::Tree;
     about = "Switch local files between public-read and root-only permissions"
 )]
 struct Cli {
-    /// Select the ordinary session account when invoking directly as root.
+    /// Select the ordinary account for sessions and editing when invoking directly as root.
     #[arg(long, global = true, value_name = "USER")]
     user: Option<String>,
     #[command(subcommand)]
@@ -32,7 +33,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Display the installed configuration lists.
+    /// Display or edit the installed configuration lists.
     Config {
         #[command(subcommand)]
         command: config::Action,
@@ -171,12 +172,8 @@ fn mutate(
 
 fn run(cli: Cli) -> Result<i32> {
     let Cli { action, user } = cli;
-    if let Action::Config {
-        command: config::Action::Show,
-    } = action
-    {
-        config::show()?;
-        return Ok(0);
+    if let Action::Config { command } = action {
+        return config::run(command, user.as_deref());
     }
     ensure!(
         unsafe { libc::geteuid() == 0 && libc::getuid() == 0 },

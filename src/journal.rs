@@ -1,15 +1,15 @@
 use std::cell::Cell;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result, ensure};
-use rustix::fs::{self, AtFlags, Dir, FlockOperation, Mode, OFlags};
+use rustix::fs::{self, AtFlags, Dir, FlockOperation, Gid, Mode, OFlags, Uid};
 use rustix::io::Errno;
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::tree::{acl_allows_public_read, check_directory_search};
+use crate::tree::{Root, Rule, acl_allows_public_read, check_directory_search, descriptor_path};
 
 const CONFIG_DIR: &str = "/etc/secret-guard";
 const STATE: &str = "/var/lib/secret-guard";
@@ -99,7 +99,7 @@ fn checked_file(
     Ok(Some(file))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, clap::ValueEnum)]
 pub enum RuleList {
     Folders,
     Secrets,
@@ -141,6 +141,22 @@ impl RuleList {
             );
         }
         Ok(entries)
+    }
+
+    fn validate_edit(self, edited: &str) -> Result<()> {
+        let entries = self.entries(edited)?;
+        match self {
+            Self::Folders => {
+                let paths: Vec<_> = entries.into_iter().map(Into::into).collect();
+                Root::open_list(&paths)?;
+            }
+            Self::Secrets | Self::Ignore => {
+                for pattern in entries {
+                    Rule::compile(&pattern)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -194,6 +210,53 @@ impl ConfigFiles {
             patterns: entries(RuleList::Secrets)?,
             ignores: entries(RuleList::Ignore)?,
         })
+    }
+
+    pub fn replace(&self, list: RuleList, original: &str, edited: &str) -> Result<()> {
+        if original == edited {
+            return Ok(());
+        }
+        list.validate_edit(edited)?;
+        let dir_path = descriptor_path(&self.directory);
+        let name = list.filename();
+        let mut pending =
+            tempfile::NamedTempFile::new_in(&dir_path).context("create replacement rule file")?;
+        pending
+            .write_all(edited.as_bytes())
+            .context("write replacement rule file")?;
+        fs::fchown(
+            &pending,
+            Some(Uid::from_raw(self.uid)),
+            Some(Gid::from_raw(self.gid)),
+        )
+        .context("set rule file owner and group")?;
+
+        // A separate open-file description releases the lock on every return.
+        // Check for concurrent changes while the uncommitted draft is still private.
+        let lock = fs::openat(&self.directory, ".", directory_flags(), Mode::empty())?;
+        fs::flock(&lock, FlockOperation::NonBlockingLockExclusive)
+            .context("configuration directory is busy; retry the edit")?;
+        ensure!(
+            self.read(list)? == original,
+            "{CONFIG_DIR}/{name} changed while editing; reopen it to apply your changes"
+        );
+        fs::fchmod(&pending, Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH)
+            .context("set rule file permissions")?;
+        ensure!(
+            acl_allows_public_read(pending.as_file())?,
+            "replacement for {name} has an access ACL entry without read permission"
+        );
+        pending
+            .as_file()
+            .sync_all()
+            .context("sync replacement rule file")?;
+
+        pending
+            .persist(dir_path.join(name))
+            .context("publish replacement rule file")?;
+        self.directory
+            .sync_all()
+            .context("sync configuration directory")
     }
 }
 
@@ -403,6 +466,77 @@ mod tests {
         write(".indexingsecrets", ".env\n")?;
         write(".indexingfolders", "\n")?;
         assert!(read_lists().is_err());
+        Ok(())
+    }
+
+    fn editable_config(dir: &Path) -> Result<ConfigFiles> {
+        disk::set_permissions(dir, disk::Permissions::from_mode(0o755))?;
+        let directory = File::open(dir)?;
+        let meta = directory.metadata()?;
+        ConfigFiles::from_directory(directory, meta.uid(), meta.gid())
+    }
+
+    #[test]
+    fn edit_repairs_one_list_and_publishes_its_exact_text() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let config = editable_config(tmp.path())?;
+        let list = RuleList::Secrets;
+        let path = tmp.path().join(list.filename());
+        let original = "# Incomplete list\n";
+        let edited = "# Local keys\n\n  .env.*\n.secrets/";
+        disk::write(&path, original)?;
+        disk::set_permissions(&path, disk::Permissions::from_mode(0o644))?;
+        let mut old = File::open(&path)?;
+        let old_meta = old.metadata()?;
+        // Reading and repairing the selected list does not depend on the other two.
+        assert_eq!(config.read(list)?, original);
+        assert!(config.scope().is_err());
+        let writer = File::open(tmp.path())?;
+        fs::flock(&writer, FlockOperation::NonBlockingLockExclusive)?;
+        assert!(config.replace(list, original, edited).is_err());
+        assert_eq!(config.read(list)?, original);
+        assert_eq!(disk::read_dir(tmp.path())?.count(), 1);
+        drop(writer);
+        config.replace(list, original, edited)?;
+        assert_eq!(config.read(list)?, edited);
+        let current = disk::metadata(&path)?;
+        assert_ne!(current.ino(), old_meta.ino());
+        assert_eq!(
+            (current.uid(), current.gid()),
+            (old_meta.uid(), old_meta.gid())
+        );
+        assert_eq!(current.mode() & 0o7777, 0o644);
+        let mut old_contents = String::new();
+        old.read_to_string(&mut old_contents)?;
+        assert_eq!(old_contents, original);
+        config.replace(list, edited, edited)?;
+        assert_eq!(disk::metadata(&path)?.ino(), current.ino());
+        assert!(config.replace(list, original, ".env\n").is_err());
+        assert_eq!(config.read(list)?, edited);
+        assert_eq!(disk::read_dir(tmp.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_edits_preserve_installed_rules_and_ignore_may_be_empty() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let config = editable_config(tmp.path())?;
+        let valid_root = tmp.path().to_str().unwrap();
+        for (list, before, rejected) in [
+            (RuleList::Folders, valid_root, "../foo"),
+            (RuleList::Folders, valid_root, " # comment \n "),
+            (RuleList::Secrets, ".env", " # comment\n"),
+            (RuleList::Secrets, ".env", "../keys/"),
+            (RuleList::Ignore, "target/", "broken["),
+        ] {
+            let path = tmp.path().join(list.filename());
+            disk::write(&path, before)?;
+            disk::set_permissions(&path, disk::Permissions::from_mode(0o644))?;
+            assert!(config.replace(list, before, rejected).is_err());
+            assert_eq!(config.read(list)?, before);
+        }
+        config.replace(RuleList::Ignore, "target/", "")?;
+        assert_eq!(config.read(RuleList::Ignore)?, "");
         Ok(())
     }
 

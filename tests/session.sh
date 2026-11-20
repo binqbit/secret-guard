@@ -65,6 +65,43 @@ for entry in '[folders]' '[secrets]' '[ignore]' '# review the paths before the f
 done
 [ ! -e /var/lib/secret-guard ]
 printf '%s\n' 'target/' > "$rules/.indexingignore"
+cp "$rules/.indexingignore" before-edit
+if setsid --fork --wait "$guard" config edit ignore --editor vim </dev/null > no-tty.log 2>&1; then
+    echo 'Opened the configuration editor without a controlling terminal' >&2
+    exit 1
+fi
+if "$guard" config edit "$work/.env" > invalid-edit.log 2>&1; then
+    echo 'Accepted a configuration edit outside the three lists' >&2
+    exit 1
+fi
+grep -F 'invalid value' invalid-edit.log >/dev/null
+cmp before-edit "$rules/.indexingignore"
+[ ! -e /var/lib/secret-guard ]
+
+# Exercise the same terminal handoff as a full-screen editor with a predictable
+# test program. The ordinary editor can replace its draft but cannot write the list.
+cat > /var/lib/sg-test-editor <<'EDITOR'
+#!/bin/sh
+set -eu
+[ "$(id -u)" = 1000 ] && [ -t 0 ] && [ -t 1 ] || exit 2
+[ -w "$1" ] && [ ! -w /etc/secret-guard/.indexingignore ] || exit 2
+printf '%s\n' 'target/' '# edited in the terminal' > "$1.new"
+mv "$1.new" "$1"
+[ ! -e fail-editor ]
+EDITOR
+chmod 0755 /var/lib/sg-test-editor
+run_config_editor() {
+    SHELL=/bin/sh script -eqc "$guard config edit ignore --editor /var/lib/sg-test-editor" /dev/null </dev/null
+}
+touch fail-editor
+if run_config_editor > editor.log 2>&1; then echo 'Failed editor published changes' >&2; exit 1; fi
+cmp before-edit "$rules/.indexingignore"
+rm fail-editor
+run_config_editor > editor.log
+grep -Fx '# edited in the terminal' "$rules/.indexingignore" >/dev/null
+[ "$(stat -c '%u:%g:%a' "$rules/.indexingignore")" = '0:0:644' ]
+as_reader cat "$rules/.indexingignore" >/dev/null
+[ ! -e /var/lib/secret-guard ]
 
 # Each invocation reads the current three lists. A root path may contain spaces.
 extra='/var/lib/sg extra root'

@@ -213,7 +213,7 @@ fn parse_acl(bytes: &[u8]) -> Result<AclPermissions> {
 
 // getxattr on the procfs magic link inspects the pinned inode without acquiring
 // a data descriptor or interrupting a lease held by another application.
-fn descriptor_path(fd: &File) -> PathBuf {
+pub(crate) fn descriptor_path(fd: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
 }
 
@@ -251,19 +251,55 @@ fn lease_is_exclusive(fd: &File) -> Result<bool> {
     Ok(kind == libc::F_WRLCK)
 }
 
-struct Root {
+pub(crate) struct Root {
     path: PathBuf,
     fd: File,
 }
 
-struct Rule {
+impl Root {
+    pub(crate) fn open_list(paths: &[PathBuf]) -> Result<Vec<Self>> {
+        let mut roots: Vec<Root> = Vec::new();
+        for path in paths {
+            ensure!(
+                path.is_absolute()
+                    && path.parent().is_some()
+                    && !path.components().any(|part| part == Component::ParentDir),
+                "specify an absolute, non-filesystem-root directory without '..': {path:?}"
+            );
+            for reserved in [
+                Path::new("/var/lib/secret-guard"),
+                Path::new("/etc/secret-guard"),
+            ] {
+                ensure!(
+                    !path.starts_with(reserved) && !reserved.starts_with(path),
+                    "root overlaps Secret Guard configuration or state: {path:?}"
+                );
+            }
+            ensure!(
+                !roots
+                    .iter()
+                    .any(|r| path.starts_with(&r.path) || r.path.starts_with(path)),
+                "overlapping roots: {path:?}"
+            );
+            let fd = fs::openat2(fs::CWD, path, DIR, Mode::empty(), ResolveFlags::NO_SYMLINKS)
+                .with_context(|| format!("open configured root {path:?}"))?;
+            roots.push(Root {
+                path: path.components().collect(),
+                fd: fd.into(),
+            });
+        }
+        Ok(roots)
+    }
+}
+
+pub(crate) struct Rule {
     matcher: GlobMatcher,
     basename: bool,
     directory: bool,
 }
 
 impl Rule {
-    fn compile(pattern: &str) -> Result<Self> {
+    pub(crate) fn compile(pattern: &str) -> Result<Self> {
         let directory = pattern.ends_with('/');
         let glob = pattern.strip_suffix('/').unwrap_or(pattern);
         ensure!(
@@ -351,36 +387,7 @@ impl Tree {
             !paths.is_empty() && !patterns.is_empty(),
             "configure at least one root and pattern"
         );
-        let mut roots: Vec<Root> = Vec::new();
-        for path in paths {
-            ensure!(
-                path.is_absolute()
-                    && path.parent().is_some()
-                    && !path.components().any(|part| part == Component::ParentDir),
-                "specify an absolute, non-filesystem-root directory without '..': {path:?}"
-            );
-            for reserved in [
-                Path::new("/var/lib/secret-guard"),
-                Path::new("/etc/secret-guard"),
-            ] {
-                ensure!(
-                    !path.starts_with(reserved) && !reserved.starts_with(path),
-                    "root overlaps Secret Guard configuration or state: {path:?}"
-                );
-            }
-            ensure!(
-                !roots
-                    .iter()
-                    .any(|r| path.starts_with(&r.path) || r.path.starts_with(path)),
-                "overlapping roots: {path:?}"
-            );
-            let fd = fs::openat2(fs::CWD, path, DIR, Mode::empty(), ResolveFlags::NO_SYMLINKS)
-                .with_context(|| format!("open configured root {path:?}"))?;
-            roots.push(Root {
-                path: path.components().collect(),
-                fd: fd.into(),
-            });
-        }
+        let roots = Root::open_list(paths)?;
         let rules = patterns
             .iter()
             .map(|p| Rule::compile(p))

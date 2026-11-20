@@ -37,11 +37,11 @@ If sudo cannot find `secret-guard`, use `/usr/local/bin/secret-guard` in its pla
 
 Secret Guard reads three lists from **`/etc/secret-guard/`**. Any local user or agent can read them without sudo, including while secrets are locked. Only root can edit or replace the installed lists. Their paths, patterns and comments are public, so keep credential values in `.secrets/`. The files at the root of this repository are installation templates.
 
-Run `config show` as your ordinary user to see the contents of all three lists under the headings `[folders]`, `[secrets]` and `[ignore]`.
+Run `config show` as your ordinary user to see the contents of all three lists under the headings `[folders]`, `[secrets]` and `[ignore]`. Open the folder list in your current terminal with `config edit`.
 
 ```sh
 secret-guard config show
-sudoedit /etc/secret-guard/.indexingfolders
+secret-guard config edit folders
 ```
 
 Replace `/home/alice/work` with the absolute path of an existing project. The walkthrough below uses `/srv/work/api`. Every directory on the way to a managed file must let all users traverse it. For example, a home directory with mode `0700` blocks public access even if the file inside is `0644`. Secret Guard reports the blocking directory before unlocking. Choose a project location suitable for shared reading.
@@ -52,7 +52,16 @@ Replace `/home/alice/work` with the absolute path of an existing project. The wa
 | [.indexingsecrets](.indexingsecrets) | Names or glob patterns of files to protect. A directory rule protects its contents recursively. | `.env`, `.env.*`, `.secrets/` |
 | [.indexingignore](.indexingignore) | Files to skip and directories to skip entirely. An ignore rule wins over a secret rule. | `.git/`, `target/`, `node_modules/`, `.env.example`, `.env.*.example` |
 
-Use `sudoedit` to change any of these lists. Keep the directory owned by `root:root` with mode `0755` and each list owned by `root:root` with mode `0644`. Blank lines and whole-line `#` comments are ignored. Enter paths with spaces without quotes. Supply at least one root and one secret rule. The ignore list may be empty.
+To choose your editor for one edit, pass `--editor`. For example, either command opens the selected list in the same terminal.
+
+```sh
+secret-guard config edit secrets --editor vim
+secret-guard config edit ignore --editor nano
+```
+
+`config edit` requests sudo access and runs the editor as your ordinary account. With `sudo secret-guard config edit`, use `--editor` if sudo filters your editor preference. By default the CLI uses `VISUAL`, then `EDITOR`, then the first installed of Vim, Nano and vi. Specify an executable name or path. In Vim, use `:wq` to save and exit. In Nano, press Ctrl+O, Enter, then Ctrl+X. Secret Guard checks the edited list before replacing the installed file. If another edit has already changed it, reopen the list to apply your changes to the current version.
+
+Keep the directory owned by `root:root` with mode `0755` and each list owned by `root:root` with mode `0644`. Blank lines and whole-line `#` comments are ignored. Enter paths with spaces without quotes. Supply at least one root and one secret rule. The ignore list may be empty.
 
 Roots cannot overlap each other or the configuration and state directories. Use absolute paths without symlinks or `..`. The filesystem root (`/`) is refused. A name such as `.env` matches at any depth. A pattern such as `config/*.key` matches relative to each root. Scans skip symlinks and nested mounts. To scan a mounted project, list its mount point as a separate, non-overlapping root.
 
