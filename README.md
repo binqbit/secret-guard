@@ -1,6 +1,6 @@
 # Secret Guard
 
-Secret Guard is a Linux command-line tool for projects that read secrets from local files such as `.env` or `.secrets/service.key`. Between work sessions, only root can open those files. Run `sudo secret-guard session` to make them readable, work with them in their usual locations, then press Enter to lock them again. You can also open a session for the lifetime of one command.
+Secret Guard is a Linux command-line tool that locks local project files between work sessions. Store real credentials in `.secrets/` and keep public settings in `.env`. The default rules manage both. Run `sudo secret-guard session` to make the files readable, work with them in their usual locations, then press Enter to lock them again. You can also open a session for the lifetime of one command.
 
 Secret Guard changes the owner and permissions of each file in place. Its contents stay on disk in plaintext throughout.
 
@@ -124,6 +124,16 @@ A crash or power loss can leave files publicly readable. Secret Guard records th
 - **What happens to the data.** During either kind of session, other local processes can read and copy the files. Secret Guard provides no encryption, backups or secure erasure. Anyone with privileged or offline disk access can read the contents, and snapshots, backups or copies made during a session may retain them.
 
 The CLI needs procfs and a local filesystem with trusted extended attributes, enabled file leases, and support for syncing files and directories. The root process needs permission to change ownership, write trusted attributes (`CAP_SYS_ADMIN`) and acquire leases (`CAP_LEASE`).
+
+## Install the Codex skill
+
+The [Secret Guard skill](skills/secret-guard/SKILL.md) teaches Codex to read the installed rules, check whether a credential path is covered and wait for the access its task needs. It also explains where to store credentials and how to keep them out of Git. From this repository, install it for your ordinary account.
+
+```sh
+install -D -m 0644 skills/secret-guard/SKILL.md "${CODEX_HOME:-$HOME/.codex}/skills/secret-guard/SKILL.md"
+```
+
+Start a new Codex session. The skill is available for credential and environment configuration tasks. You can also invoke it explicitly, for example, `$secret-guard Configure the client to read its service token from a file.`
 
 ## Development and workspace indexing
 
