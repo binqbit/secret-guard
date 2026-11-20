@@ -1,0 +1,19 @@
+[package]
+name = "secret-guard"
+version = "0.1.0"
+edition = "2024"
+description = "Temporary work sessions for root-protected local files on Linux"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+globset = "0.4"
+libc = "0.2"
+nix = { version = "0.30", features = ["user"] }
+rustix = { version = "1.1", features = ["fs", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

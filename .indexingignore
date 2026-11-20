@@ -1,0 +1,8 @@
+# Secret Guard skips these directories at any depth.
+.git/
+target/
+node_modules/
+
+# These files contain public example values only.
+.env.example
+.env.*.example
