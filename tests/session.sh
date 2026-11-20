@@ -750,4 +750,34 @@ untouched "$selected/.env.deferred"
 "$guard" session "$selected" -- /bin/sh -ec 'test -w "$1"' sh "$selected/.env.deferred"
 locked "$selected/.env.deferred"
 echo 'PASS: explicit root precedence, inner exclusions, saved selection and earlier journal recovery'
+
+# An interrupted sync can leave the new marker or permissions visible. Inject
+# errors only into fsync of the fixture or its parent, and retry the same journal.
+if command -v strace >/dev/null 2>&1; then
+    sync_dir="$work/sync-recovery"
+    sync_file="$sync_dir/.env"
+    sync_journal=/var/lib/secret-guard/named-sync-check/session.json
+    install -d -o 1000 -g 1000 -m 0700 "$sync_dir"
+    install -o 1000 -g 1000 -m 0600 /dev/null "$sync_file"
+    fail_sync() {
+        if strace -e trace=fsync -e inject=fsync:error=EIO -P "$1" -o fsync.trace \
+            "$guard" lock sync-check --path "$sync_dir" > fsync.log 2>&1; then
+            echo "Lock succeeded despite sync failure on $1" >&2; exit 1
+        fi
+        grep -F 'INJECTED' fsync.trace >/dev/null
+        grep -F "$2" fsync.log >/dev/null
+        test -e "$sync_journal"
+    }
+    for attempt in 1 2; do
+        fail_sync "$sync_file" 'sync the secret ownership marker'
+        opened "$sync_file"
+    done
+    fail_sync "$sync_dir" 'sync the parent directory'
+    locked "$sync_file"
+    fail_sync "$sync_file" 'sync file ownership and permissions'
+    fail_sync "$sync_dir" 'sync the parent directory'
+    "$guard" lock sync-check
+    test ! -e "$sync_journal"
+    echo 'PASS: retry enrollment, file and directory sync before clearing the journal'
+fi
 GUEST

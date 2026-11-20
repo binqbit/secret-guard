@@ -599,17 +599,18 @@ impl Tree {
         if require_lease && (!take_exclusive_lease(&fd)? || !lease_is_exclusive(&fd)?) {
             return Ok(Change::Busy);
         }
-        if !open && before.is_locked(self.uid) {
-            return Ok(Change::Done);
-        }
-        if before.marker_uid.is_none() {
+        let enrolling = before.marker_uid.is_none();
+        if enrolling {
             let mut value = [1u8; 5];
             value[1..].copy_from_slice(&self.uid.to_be_bytes());
             fs::fsetxattr(&fd, MARKER, &value, XattrFlags::CREATE).context(
                 "record the verified file owner (trusted xattrs and CAP_SYS_ADMIN required)",
             )?;
-            // A root-owned inode must never survive a crash without its enrollment.
-            fd.sync_all()?;
+        }
+        if enrolling || (!open && before.uid != 0) {
+            // A failed sync can leave the marker visible. Retry it before giving
+            // the inode to root, so the enrollment survives a crash as well.
+            fd.sync_all().context("sync the secret ownership marker")?;
         }
 
         let restricted = Mode::RUSR | Mode::WUSR;
@@ -638,12 +639,16 @@ impl Tree {
             }
             fs::fchmod(&fd, restricted)?;
         }
-        fd.sync_all()?;
+        // Even an already-locked inode may be here because an earlier sync failed.
+        fd.sync_all()
+            .context("sync file ownership and permissions")?;
         let parent = relative
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        open_beneath(&root.fd, parent, DIR)?.sync_all()?;
+        open_beneath(&root.fd, parent, DIR)?
+            .sync_all()
+            .context("sync the parent directory of the managed file")?;
         verify_name(wanted_uid)?;
         let after = FileAccess::inspect(&pinned)?;
         ensure!(

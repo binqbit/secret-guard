@@ -206,7 +206,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 ```
 
-For the privileged integration test, use a disposable Linux VM with util-linux, GNU coreutils and findutils. The test mounts temporary filesystems in a private mount namespace and exercises two ordinary UIDs.
+For the privileged integration test, use a disposable Linux VM with util-linux, GNU coreutils and findutils. The test mounts temporary filesystems in a private mount namespace and exercises two ordinary UIDs. Install `setfacl` to include ACL scenarios and `strace` to test recovery from file and directory sync errors.
 
 ```sh
 cargo build --release --locked
