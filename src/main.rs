@@ -47,6 +47,8 @@ enum Action {
     },
     /// Lock matching files, or safely finish an interrupted session.
     Lock,
+    /// Open matching files and leave access open until a separate lock.
+    Unlock,
     /// Open the files until Enter, or run a command as the session user.
     Session {
         #[arg(last = true, value_name = "COMMAND", num_args = 0..)]
@@ -65,6 +67,10 @@ const RECOVERY: &str = "Run 'sudo secret-guard lock' to rescan the roots and clo
 
 fn describe(session: Option<&Session>, idle: bool) {
     if let Some(s) = session {
+        if s.is_manual_open() {
+            println!("OPEN / manual (user {:?}, UID {})", s.user, s.uid);
+            return;
+        }
         let activity = if idle {
             "OPEN / recovery required"
         } else {
@@ -122,15 +128,24 @@ fn mutate(
     scope: &Scope,
 ) -> Result<i32> {
     if let Some(s) = &session {
+        match &action {
+            Action::Session { .. } if s.is_manual_open() => {
+                bail!(
+                    "files are manually unlocked; run 'sudo secret-guard lock' before starting a session"
+                );
+            }
+            Action::Session { .. } => bail!("an unfinished operation was found. {RECOVERY}"),
+            Action::Unlock if !s.is_manual_open() => {
+                bail!("an unfinished operation was found. {RECOVERY}");
+            }
+            _ => (),
+        }
         s.validate(tree, user.uid, scope)?;
     }
     let signals = SessionSignals::install()?;
     if matches!(action, Action::Lock) {
         if let Some(mut interrupted) = session {
-            // The original journal remains sufficient to retry if space is exhausted.
-            if let Err(e) = interrupted.phase(store, Phase::Closing) {
-                eprintln!("Could not update the recovery phase: {e:#}");
-            }
+            interrupted.begin_close(store)?;
         } else {
             Session::start(store, tree, user, scope, Phase::Closing)?;
         }
@@ -138,14 +153,12 @@ fn mutate(
         AccessMessage::Locked.write(&mut std::io::stdout().lock())?;
         return Ok(0);
     }
-    let Action::Session { command } = action else {
-        unreachable!()
+    let command = match action {
+        Action::Session { command } => Some(command),
+        Action::Unlock => None,
+        _ => unreachable!(),
     };
-    ensure!(
-        session.is_none(),
-        "an unfinished operation was found. {RECOVERY}"
-    );
-    let interactive = command.is_empty();
+    let interactive = command.as_ref().is_some_and(Vec::is_empty);
     if interactive {
         runtime::check_interactive()?;
     }
@@ -154,21 +167,46 @@ fn mutate(
         !signals.interrupted(),
         "interrupted before opening the session"
     );
-    let mut active = Session::start(store, tree, user, scope, Phase::Opening)?;
-    // Even a partial opening or a failed child launch goes through the same close path.
-    let result = state::open_files(tree, user, &files, || signals.interrupted())
-        .and_then(|()| active.phase(store, Phase::Running))
-        .and_then(|()| AccessMessage::Unlocked.session(interactive))
-        .and_then(|()| signals.run(user, &command));
-    // The existing durable journal is sufficient for recovery if updating its phase fails.
-    let phase_update = active.phase(store, Phase::Closing);
-    state::close(store, tree, user, &signals).with_context(|| match &result {
-        Err(e) => format!("session failed ({e:#}); closing also failed"),
-        Ok(_) => "closing the session failed".to_string(),
-    })?;
-    AccessMessage::Locked.session(interactive)?;
-    if let Err(error) = phase_update {
-        eprintln!("Could not update the closing phase before locking: {error:#}");
+    let opening = if command.is_some() {
+        Phase::Opening
+    } else {
+        Phase::ManualOpening
+    };
+    let mut active = match session {
+        Some(mut manual) => {
+            manual.phase(store, opening)?;
+            manual
+        }
+        None => Session::start(store, tree, user, scope, opening)?,
+    };
+    let opened = state::open_files(tree, user, &files, || signals.interrupted());
+    let result = if let Some(command) = &command {
+        opened
+            .and_then(|()| active.phase(store, Phase::Running))
+            .and_then(|()| AccessMessage::Unlocked.session(interactive))
+            .and_then(|()| signals.run(user, command))
+    } else {
+        match opened.and_then(|()| {
+            ensure!(!signals.interrupted(), "manual unlock interrupted");
+            active.phase(store, Phase::Manual)?;
+            AccessMessage::Unlocked.write(&mut std::io::stdout().lock())
+        }) {
+            Ok(()) => return Ok(0),
+            Err(error) => Err(error),
+        }
+    };
+    // A partial open, failed command launch or interrupted unlock also takes this path.
+    active
+        .begin_close(store)
+        .and_then(|()| state::close(store, tree, user, &signals))
+        .with_context(|| match &result {
+            Err(e) => format!("operation failed ({e:#}); closing also failed"),
+            Ok(_) => "closing the session failed".to_string(),
+        })?;
+    if command.is_some() {
+        AccessMessage::Locked.session(interactive)?;
+    } else {
+        AccessMessage::Locked.write(&mut std::io::stdout().lock())?;
     }
     result
 }
@@ -187,7 +225,12 @@ fn run(cli: Cli) -> Result<i32> {
     let user = runtime::resolve_user(user.as_deref())?;
     let store = JournalStore::open()?;
     let idle = store.try_exclusive()?;
-    if !idle && matches!(action, Action::Lock | Action::Session { .. }) {
+    if !idle
+        && matches!(
+            action,
+            Action::Lock | Action::Unlock | Action::Session { .. }
+        )
+    {
         bail!(
             "another Secret Guard operation is active; inspect it with 'sudo secret-guard status'"
         );
@@ -195,12 +238,15 @@ fn run(cli: Cli) -> Result<i32> {
     let session: Option<Session> = store.load()?;
     if matches!(action, Action::Status { paths: false }) {
         describe(session.as_ref(), idle);
-    } else if session.is_some() && idle {
+    } else if idle && session.as_ref().is_some_and(|s| !s.is_manual_open()) {
         eprintln!("Unfinished operation found. {RECOVERY}");
     }
+    // A manual opening outlives this process. Close exactly the selection that was
+    // opened, even if an administrator subsequently changes the installed lists.
     let saved_scope = match &action {
+        Action::Status { paths: true } => None,
         Action::Status { paths: false } => session.as_ref().map(Session::scope),
-        _ => None,
+        _ => session.as_ref().and_then(Session::manual_scope),
     };
     let scope = if let Some(scope) = saved_scope {
         scope.clone()
@@ -243,7 +289,7 @@ fn run(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Action::Lock | Action::Session { .. } => {
+        Action::Lock | Action::Unlock | Action::Session { .. } => {
             let result = mutate(action, &store, session, &tree, &user, &scope);
             if result.is_err() {
                 match store.load::<Session>() {

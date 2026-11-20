@@ -1,6 +1,6 @@
 # Secret Guard
 
-Secret Guard is a Linux command-line tool that locks local project files between work sessions. Store real credentials in `.secrets/` and keep public settings in `.env`. The default rules manage both. Run `sudo secret-guard session` to make the files readable, work with them in their usual locations, then press Enter to lock them again. You can also open a session for the lifetime of one command.
+Secret Guard is a Linux command-line tool that locks local project files between work sessions. Store real credentials in `.secrets/` and keep public settings in `.env`. The default rules manage both. Use `unlock` and `lock` to control access manually, or use `session` to lock the files when you press Enter or a work command exits.
 
 Secret Guard changes the owner and permissions of each file in place. Its contents stay on disk in plaintext throughout.
 
@@ -81,7 +81,7 @@ The first status line describes the session. Each file then gets a label (`locke
 
 Run `secret-guard config reset` to **overwrite all three installed lists** with the defaults embedded in the current binary. The command requests sudo and sets the search root to the calling user's home. From a root shell, select the ordinary account with `secret-guard --user alice config reset`.
 
-Reset requires closed access. Finish an active session, or run `sudo secret-guard lock` to recover an interrupted session. The reset changes only the three rule lists. Existing secrets keep their contents and permissions. Save any rules you want to reuse. A locked file outside the new selection stays root-only until you include it again.
+Reset requires closed access. Finish an active session, or run `sudo secret-guard lock` to close a manual unlock or recover an interrupted session. The reset changes only the three rule lists. Existing secrets keep their contents and permissions. Save any rules you want to reuse. A locked file outside the new selection stays root-only until you include it again.
 
 ```sh
 secret-guard config reset
@@ -92,7 +92,18 @@ If the reset is interrupted, run it again from the same account and review the r
 
 ## Everyday use
 
-**To work interactively**, start a session in a foreground terminal.
+**To unlock manually**, run `unlock`. It prints `UNLOCKED` and returns you to the shell. The files stay publicly readable until you run `lock`, even if you close the terminal. Use the same account to close access before starting a session or resetting the configuration.
+
+```console
+$ sudo secret-guard unlock
+UNLOCKED
+$ sudo secret-guard lock
+LOCKED
+```
+
+Closing a manual unlock uses its saved rules, even if you edited the installed lists or the operation was interrupted.
+
+**To lock on Enter**, start a session in a foreground terminal.
 
 ```console
 $ sudo secret-guard session
@@ -127,17 +138,18 @@ Close the listed file in the process using it, or stop that process. Return to t
 
 | What you see | What to do |
 | --- | --- |
+| `OPEN / manual` | The `unlock` command completed. When finished, run `sudo secret-guard lock` from the account that opened access. |
 | `OPEN / active` | Return to the session terminal, or let its work command finish. Ctrl+C requests an orderly close. |
 | `OPEN / recovery required` | The supervisor has exited. Resolve the reported problem and run `sudo secret-guard lock` as the original user. Check `status` afterward. |
 | Busy paths in a job without a foreground terminal | The job exits with an error and leaves the operation open. Release the files and run `sudo secret-guard lock` again. |
 
-A crash or power loss can leave files publicly readable. Secret Guard records the session user, phase and scan scope in `/var/lib/secret-guard/session.json`, inside a root-only directory (`0700`). A successful close removes the journal. An active session uses the lists it read when it started. For recovery, use those same entries in their original order and the same root directories.
+A crash or power loss can leave files publicly readable. Secret Guard records the opening user, phase and selection rules in `/var/lib/secret-guard/session.json`, inside a root-only directory (`0700`). A successful close removes the journal. To recover an interrupted `session`, run `lock` with its original root directories and list entries in their original order. Restore them first if they have changed.
 
 ## Security model
 
 - **Who can unlock a file.** The ordinary sudo caller is the session user. On first use, a file must belong to that user. Secret Guard records their UID in a root-protected `trusted.secret_guard` attribute so it can recognize the file after taking ownership. It refuses unrelated root-owned files, files belonging to another user, hard-linked files and matching special files. From a root shell, specify the original ordinary account, for example `secret-guard --user alice lock`. [Linux extended attributes](https://man7.org/linux/man-pages/man7/xattr.7.html)
 - **What locking covers.** Secret Guard checks the file's identity beneath the configured root and takes an exclusive file lease when locking it. Someone who can write to a parent directory may still rename, replace or delete a locked file. Moving a file outside the selection takes it beyond the next scan. Files created after closure keep their creator's permissions until another lock. [Linux path resolution](https://man7.org/linux/man-pages/man2/openat2.2.html) · [Linux file leases](https://man7.org/linux/man-pages/man2/F_SETLEASE.2const.html)
-- **What happens to the data.** During either kind of session, other local processes can read and copy the files. Secret Guard provides no encryption, backups or secure erasure. Anyone with privileged or offline disk access can read the contents, and snapshots, backups or copies made during a session may retain them.
+- **What happens to the data.** While files are unlocked, other local processes can read and copy them. Secret Guard provides no encryption, backups or secure erasure. Anyone with privileged or offline disk access can read the contents, and snapshots, backups or copies made while the files are open may retain them.
 
 The CLI needs procfs and a local filesystem with trusted extended attributes, enabled file leases, and support for syncing files and directories. The root process needs permission to change ownership, write trusted attributes (`CAP_SYS_ADMIN`) and acquire leases (`CAP_LEASE`).
 

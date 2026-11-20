@@ -86,6 +86,9 @@ printf '"%s"\n' "$editor_home/.env" | cmp - first-paths.out
 cmp /etc/editor-defaults/.indexingfolders "$rules/.indexingfolders"
 
 # The top-level commands have distinct roles.
+"$guard" --help | sed -n '/^Commands:/,/^Options:/{s/^  \([a-z][a-z]*\)  *.*/\1/p;}' > commands.out
+[ "$(wc -l < commands.out)" -eq 5 ]
+for name in config status lock unlock session; do grep -Fx "$name" commands.out >/dev/null; done
 if "$guard" scan > invalid-command.log 2>&1; then echo 'Accepted a top-level scan' >&2; exit 1; fi
 grep -F "unrecognized subcommand 'scan'" invalid-command.log >/dev/null
 
@@ -270,9 +273,64 @@ if as_reader cat .env >/dev/null 2>&1; then echo 'Locked file is readable' >&2; 
 "$guard" status > locked-status.out
 grep -Fx "locked  0:0 0600  \"$work/.env\"" locked-status.out >/dev/null
 
+# Manual unlock exits without a terminal; access persists until a separate lock.
+setsid --fork --wait "$guard" unlock </dev/null > unlock.out
+grep -Fx 'UNLOCKED' unlock.out >/dev/null
+"$guard" status > manual-status.out
+grep -F 'OPEN / manual' manual-status.out >/dev/null
+grep -Fx "public-read mode  1000:1000 0644  \"$work/.env\"" manual-status.out >/dev/null
+if grep -F 'recovery required' manual-status.out >/dev/null; then echo 'Manual unlock reported as a crash' >&2; exit 1; fi
+[ "$(as_reader cat .env)" = before ]
+if as_reader sh -c ': >> .env' 2>/dev/null; then echo 'Reader can write after manual unlock' >&2; exit 1; fi
+if "$guard" session -- touch unexpected-session > rejected-session.log 2>&1; then echo 'Session took over manual unlock' >&2; exit 1; fi
+[ ! -e unexpected-session ]
+if "$guard" config reset > reset-manual.log 2>&1; then echo 'Reset manually unlocked rules' >&2; exit 1; fi
+if (unset SUDO_UID; "$guard" --user reader unlock) > wrong-user.log 2>&1; then
+    echo 'A different account took over manually unlocked files' >&2; exit 1
+fi
+setpriv --reuid=1000 --regid=1000 --clear-groups sh -ec '
+    printf "manual edit\n" > .env
+    printf "created while unlocked\n" > .env.manual
+    chmod 0600 .env.manual
+'
+# Installed rules may be edited while files are open. Status and closing must remember
+# the open scope; --paths previews the next selection under today's installed rules.
+touch "$extra/.env"
+chown 1000:1000 "$extra/.env"
+chmod 0600 "$extra/.env"
+cp "$rules/.indexingfolders" before-manual-scope
+printf '%s\n' "$extra" > "$rules/.indexingfolders"
+"$guard" unlock >/dev/null
+[ "$(stat -c '%u:%g:%a' .env.manual)" = '1000:1000:644' ]
+"$guard" status > manual-scope.out
+grep -F "\"$work/.env\"" manual-scope.out >/dev/null
+if grep -F "\"$extra/.env\"" manual-scope.out >/dev/null; then echo 'Manual status lost original scope' >&2; exit 1; fi
+"$guard" status --paths > installed-paths.out
+grep -Fx "\"$extra/.env\"" installed-paths.out >/dev/null
+if grep -F "\"$work/.env\"" installed-paths.out >/dev/null; then echo 'Path preview ignored installed rules' >&2; exit 1; fi
+exec 3<.env.manual
+if setsid --fork --wait "$guard" lock 3<&- </dev/null > manual-busy.log 2>&1; then
+    echo 'Manual lock reported success while a reader held .env.manual' >&2; exit 1
+fi
+grep -F "$work/.env.manual" manual-busy.log >/dev/null
+locked .env
+"$guard" status > manual-recovery.out
+grep -F 'OPEN / recovery required' manual-recovery.out >/dev/null
+if "$guard" unlock > manual-reopen.log 2>&1; then echo 'Unlock took over partial manual close' >&2; exit 1; fi
+exec 3<&-
+"$guard" lock
+locked .env && locked .secrets/key && locked .env.manual || exit 1
+[ "$(stat -c '%u:%g:%a' "$extra/.env")" = '1000:1000:600' ]
+cp before-manual-scope "$rules/.indexingfolders"
+[ "$(cat .env)" = 'manual edit' ]
+[ "$(cat .env.manual)" = 'created while unlocked' ]
+[ "$(stat -c '%d:%i' .env)" = "$inode" ]
+"$guard" status > closed-status.out
+grep -Fx 'No open session.' closed-status.out >/dev/null
+
 "$guard" session -- /bin/sh -eu -c '
     [ "$(id -u)" = 1000 ]
-    [ "$(cat .env)" = before ]
+    [ "$(cat .env)" = "manual edit" ]
     printf "edited\n" > .env
     printf "new\n" > .env.new
     touch ready
@@ -288,6 +346,7 @@ for attempt in $(seq 1 100); do
     sleep 0.1
 done
 [ -e ready ] || { echo 'Timed out waiting for the session' >&2; exit 1; }
+if "$guard" unlock > unlock-active.log 2>&1; then echo 'Unlock took over an active session' >&2; exit 1; fi
 if "$guard" config reset > reset-open.log 2>&1; then echo 'Reset an active session' >&2; exit 1; fi
 grep -Fx "$work" "$rules/.indexingfolders" >/dev/null
 [ "$(stat -c '%u:%g:%a' /var/lib/secret-guard)" = '0:0:700' ]
@@ -322,6 +381,7 @@ grep -F "$work/.env.busy" busy.log >/dev/null
 grep -F 'sudo secret-guard lock' busy.log >/dev/null
 [ "$(stat -c '%u:%g:%a' .env.busy)" = '1000:1000:644' ]
 locked .env.available
+if "$guard" unlock > unlock-recovery.log 2>&1; then echo 'Unlock took over an unfinished recovery' >&2; exit 1; fi
 if "$guard" config reset > reset-recovery.log 2>&1; then echo 'Reset with unfinished recovery' >&2; exit 1; fi
 grep -Fx "$work" "$rules/.indexingfolders" >/dev/null
 exec 3<&-

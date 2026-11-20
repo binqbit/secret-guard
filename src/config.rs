@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
 
 use crate::journal::{self, ConfigFiles, RuleList};
@@ -63,10 +63,14 @@ fn reset(selected_user: Option<&str>) -> Result<i32> {
         store.try_exclusive()?,
         "another Secret Guard operation is active; finish it before resetting the configuration"
     );
-    ensure!(
-        store.load::<Session>()?.is_none(),
-        "an unfinished operation needs recovery; run 'sudo secret-guard lock' before resetting the configuration"
-    );
+    if let Some(session) = store.load::<Session>()? {
+        let state = if session.is_manual_open() {
+            "files are manually unlocked"
+        } else {
+            "an unfinished operation needs recovery"
+        };
+        bail!("{state}; run 'sudo secret-guard lock' before resetting the configuration");
+    }
     journal::reset_config(&user.home)?;
     println!("Restored the three installed rule lists to their packaged defaults.");
     Ok(0)
