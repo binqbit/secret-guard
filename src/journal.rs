@@ -10,7 +10,9 @@ use rustix::fs::{self, AtFlags, Dir, FlockOperation, Gid, Mode, OFlags, Uid};
 use rustix::io::Errno;
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::tree::{Root, Rule, acl_allows_public_read, check_directory_search, descriptor_path};
+use crate::tree::{
+    IgnoreRule, Root, Rule, acl_allows_public_read, check_directory_search, descriptor_path,
+};
 
 const CONFIG_DIR: &str = "/etc/secret-guard";
 const STATE: &str = "/var/lib/secret-guard";
@@ -166,9 +168,14 @@ impl RuleList {
                 let paths: Vec<_> = entries.into_iter().map(Into::into).collect();
                 Root::open_list(&paths)?;
             }
-            Self::Secrets | Self::Ignore => {
+            Self::Secrets => {
                 for pattern in entries {
                     Rule::compile(&pattern)?;
+                }
+            }
+            Self::Ignore => {
+                for pattern in entries {
+                    IgnoreRule::compile(&pattern)?;
                 }
             }
         }

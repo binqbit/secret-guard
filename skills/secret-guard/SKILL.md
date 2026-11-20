@@ -12,7 +12,7 @@ description: Use when storing local credentials, wiring applications to secret f
 
 ## Working with Secret Guard
 
-Read the installed rules in `/etc/secret-guard/` without sudo. Repository copies are templates. The path must lie under a root in `.indexingfolders` and match `.indexingsecrets` (typically `.secrets/`). Exclusions in `.indexingignore` take precedence. A search root can be shared. On first use, the file must belong to the opening user, who must be able to traverse the path. Scans skip symlinks and nested mounts. Report missing rules or uncovered paths before relying on Secret Guard.
+Read the installed rules in `/etc/secret-guard/` without sudo. Repository copies are templates. The path must lie under a root in `.indexingfolders` and match `.indexingsecrets` (typically `.secrets/`). Exclusions in `.indexingignore` win, including absolute file or directory paths and exact root-relative paths beginning with `./`. A search root can be shared. On first use, the file must belong to the opening user, who must be able to traverse the path. Scans skip symlinks and nested mounts. Report missing rules or uncovered paths before relying on Secret Guard.
 
 | File | Can read | Can write |
 | --- | --- | --- |

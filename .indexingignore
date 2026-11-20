@@ -6,3 +6,9 @@ node_modules/
 # These files contain public example values only.
 .env.example
 .env.*.example
+
+# Uncomment and adapt an exact path to exclude a file or a directory tree.
+# ./fixtures/.env
+# ./test data/
+# /srv/work/api/.env.local
+# /srv/work/api/generated/

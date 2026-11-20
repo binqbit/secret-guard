@@ -55,6 +55,17 @@ Keep the directory owned by `root:root` with mode `0755` and each list owned by 
 
 Roots cannot overlap each other or the configuration and state directories. Use absolute paths without symlinks or `..`. The filesystem root (`/`) is refused. A name such as `.env` matches at any depth. A pattern such as `config/*.key` matches relative to each root. Scans skip symlinks and nested mounts. To scan a mounted project, list its mount point as a separate, non-overlapping root.
 
+The entries below illustrate how to exclude files and directory trees in `.indexingignore`. Each relative entry is interpreted from **each selected search root**. Paths starting with `./` or `/` are literal, so characters such as `*` and `[` in those paths refer to the filename itself. An absolute exclusion never adds a directory to the search.
+
+| Ignore entry | What Secret Guard skips |
+| --- | --- |
+| `build/` | Every directory named `build` and its contents. |
+| `services/*/generated/` | The matching generated trees relative to each root. |
+| `./fixtures/.env` | The exact `fixtures/.env` immediately beneath each root. |
+| `./fixtures/sample data` | The literal file or entire directory at that relative path. |
+| `/srv/work/api/.env.local` | That exact file when it falls within the selected roots. |
+| `/srv/work/api/fixtures` | That directory and its contents. A trailing slash limits the exclusion to a directory. |
+
 ### 3. Preview the selection, then lock it
 
 Run these commands from the ordinary account that owns the project secrets. `status --paths` always lists matches for the currently installed rules. Full `status` reports access and permissions. While any operation is open, it scans using the roots and rules saved when that operation began, even if the installed lists have since changed.

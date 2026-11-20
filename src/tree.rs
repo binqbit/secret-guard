@@ -341,10 +341,57 @@ impl Rule {
     }
 }
 
+pub(crate) enum IgnoreRule {
+    Exact { path: PathBuf, directory_only: bool },
+    Pattern(Rule),
+}
+
+impl IgnoreRule {
+    pub(crate) fn compile(entry: &str) -> Result<Self> {
+        ensure!(!entry.contains('\0'), "invalid ignore entry {entry:?}");
+        let path = Path::new(entry);
+        if path.is_absolute() || entry.starts_with("./") {
+            ensure!(
+                !path.components().any(|part| part == Component::ParentDir),
+                "ignore path must not contain '..': {entry:?}"
+            );
+            return Ok(Self::Exact {
+                path: path
+                    .components()
+                    .filter(|part| *part != Component::CurDir)
+                    .collect(),
+                directory_only: entry.ends_with('/'),
+            });
+        }
+        Ok(Self::Pattern(Rule::compile(entry)?))
+    }
+
+    fn excludes(&self, absolute: &Path, relative: &Path, is_directory: bool) -> bool {
+        match self {
+            Self::Exact {
+                path,
+                directory_only,
+            } => {
+                let candidate = if path.is_absolute() {
+                    absolute
+                } else {
+                    relative
+                };
+                candidate.starts_with(path)
+                    && (candidate != path || is_directory || !directory_only)
+            }
+            Self::Pattern(rule) if is_directory => {
+                rule.directory && !relative.as_os_str().is_empty() && rule.matches(relative)
+            }
+            Self::Pattern(rule) => rule.covers_file(relative),
+        }
+    }
+}
+
 pub struct Tree {
     roots: Vec<Root>,
     rules: Vec<Rule>,
-    ignores: Vec<Rule>,
+    ignores: Vec<IgnoreRule>,
     uid: u32,
 }
 
@@ -393,7 +440,7 @@ impl Tree {
             .collect::<Result<_>>()?;
         let ignores = ignores
             .iter()
-            .map(|p| Rule::compile(p))
+            .map(|p| IgnoreRule::compile(p))
             .collect::<Result<_>>()?;
         Ok(Self {
             roots,
@@ -403,7 +450,13 @@ impl Tree {
         })
     }
 
-    fn relative_matches(&self, relative: &Path) -> bool {
+    fn excluded(&self, absolute: &Path, relative: &Path, is_directory: bool) -> bool {
+        self.ignores
+            .iter()
+            .any(|rule| rule.excludes(absolute, relative, is_directory))
+    }
+
+    fn matches_file(&self, absolute: &Path, relative: &Path) -> bool {
         if relative.as_os_str().is_empty()
             || relative.starts_with(LEGACY_STAGE)
             || relative
@@ -413,7 +466,7 @@ impl Tree {
             return false;
         }
         self.rules.iter().any(|rule| rule.covers_file(relative))
-            && !self.ignores.iter().any(|rule| rule.covers_file(relative))
+            && !self.excluded(absolute, relative, false)
     }
 
     fn locate<'a>(&self, path: &'a Path) -> Result<(&Root, &'a Path)> {
@@ -421,7 +474,8 @@ impl Tree {
             .iter()
             .find_map(|root| {
                 let relative = path.strip_prefix(&root.path).ok()?;
-                self.relative_matches(relative).then_some((root, relative))
+                self.matches_file(path, relative)
+                    .then_some((root, relative))
             })
             .with_context(|| format!("path outside configured selection: {path:?}"))
     }
@@ -441,6 +495,9 @@ impl Tree {
         let mut result = BTreeMap::new();
         for root in &self.roots {
             check_root(root)?;
+            if self.excluded(&root.path, Path::new(""), true) {
+                continue;
+            }
             let mut dirs = vec![PathBuf::new()];
             while let Some(dir) = dirs.pop() {
                 let relative = if dir.as_os_str().is_empty() {
@@ -471,16 +528,13 @@ impl Tree {
                             }
                         };
                     let meta = pinned.metadata()?;
+                    let absolute = root.path.join(&child);
                     if meta.is_dir() {
-                        if !self
-                            .ignores
-                            .iter()
-                            .any(|r| r.directory && r.matches(&child))
-                        {
+                        if !self.excluded(&absolute, &child, true) {
                             dirs.push(child);
                         }
-                    } else if !meta.is_symlink() && self.relative_matches(&child) {
-                        result.insert(root.path.join(&child), FileAccess::inspect(&pinned)?);
+                    } else if !meta.is_symlink() && self.matches_file(&absolute, &child) {
+                        result.insert(absolute, FileAccess::inspect(&pinned)?);
                     }
                 }
             }
@@ -638,6 +692,130 @@ mod tests {
         assert!(t.locate(&root.join("target/.env")).is_err());
         assert!(t.locate(&root.join(".secret-guard-stage/.env")).is_err());
         assert!(Tree::new(&[root], &["../.env".into()], &[], 1000).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn absolute_ignores_match_exact_paths_across_search_roots() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let first = workspace.path().join("first");
+        let second = workspace.path().join("second");
+        let excluded_root = workspace.path().join("excluded/project");
+        let entries = [
+            "dir[1]/deep/key",
+            "dir1/deep/key",
+            "key*",
+            "key-extra",
+            "regular",
+        ];
+        for root in [&first, &second, &excluded_root] {
+            for entry in entries {
+                let file = root.join(entry);
+                disk::create_dir_all(file.parent().unwrap())?;
+                disk::write(file, b"fixture")?;
+            }
+        }
+        let mut ignores = vec![
+            first.join("dir[1]").display().to_string(),
+            second.join("dir1/").display().to_string(),
+            first.join("key*").display().to_string(),
+            first.join("regular/").display().to_string(),
+            workspace
+                .path()
+                .join("outside/absent")
+                .display()
+                .to_string(),
+            workspace.path().join("excluded").display().to_string(),
+        ];
+        let roots = [first.clone(), second.clone(), excluded_root.clone()];
+        let make_tree = |ignores: &[String]| Tree::new(&roots, &["*".into()], ignores, 1000);
+        let tree = make_tree(&ignores)?;
+        let visible: BTreeSet<_> = tree.scan()?.into_keys().collect();
+        let expected = [
+            first.join("dir1/deep/key"),
+            first.join("key-extra"),
+            first.join("regular"),
+            second.join("dir[1]/deep/key"),
+            second.join("key*"),
+            second.join("key-extra"),
+            second.join("regular"),
+        ];
+        assert_eq!(visible, expected.into_iter().collect());
+        for hidden in [
+            first.join("dir[1]/deep/key"),
+            first.join("key*"),
+            excluded_root.join("regular"),
+        ] {
+            assert!(tree.locate(&hidden).is_err());
+        }
+        ignores.push(first.display().to_string());
+        assert!(
+            make_tree(&ignores)?
+                .scan()?
+                .keys()
+                .all(|p| p.starts_with(&second))
+        );
+        assert!(IgnoreRule::compile("/where/../else").is_err());
+        assert!(Rule::compile("/where/key").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn relative_ignore_paths_prune_named_directories() -> Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let root = workspace.path();
+        for entry in [
+            "cache/key",
+            "nested/cache/key",
+            "skip/key",
+            "nested/skip/key",
+            "app/generated/deep/key",
+            "nested/app/generated/key",
+            "build.tmp/key",
+            "key.tmp",
+            "legacy/key",
+            "nested/legacy",
+            "folder[1]/key",
+            "folder1/key",
+        ] {
+            let file = root.join(entry);
+            disk::create_dir_all(file.parent().unwrap())?;
+            disk::write(file, b"fixture")?;
+        }
+        let tree = Tree::new(
+            &[root.into()],
+            &["*".into()],
+            &[
+                "./cache".into(),
+                "skip/".into(),
+                "app/generated/".into(),
+                "legacy".into(),
+                "./folder[1]".into(),
+                "*.tmp".into(),
+            ],
+            1000,
+        )?;
+        let expected = [
+            "nested/cache/key",
+            "nested/app/generated/key",
+            "build.tmp/key",
+            "legacy/key",
+            "folder1/key",
+        ];
+        assert_eq!(
+            tree.scan()?.into_keys().collect::<BTreeSet<_>>(),
+            expected.map(|name| root.join(name)).into_iter().collect()
+        );
+        for hidden in [
+            "cache/key",
+            "nested/skip/key",
+            "app/generated/deep/key",
+            "key.tmp",
+            "nested/legacy",
+            "folder[1]/key",
+        ] {
+            assert!(tree.locate(&root.join(hidden)).is_err());
+        }
         Ok(())
     }
 
