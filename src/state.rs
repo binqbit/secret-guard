@@ -122,7 +122,7 @@ pub fn preflight(tree: &Tree, user: &User) -> Result<BTreeMap<PathBuf, FileAcces
     let files = tree.scan()?;
     for (path, access) in &files {
         access
-            .validate_open(user.uid)
+            .validate(user.uid)
             .with_context(|| format!("cannot open {path:?}"))?;
     }
     runtime::check_file_access(user, &files, Access::EXISTS)?;
@@ -148,7 +148,7 @@ pub fn open_files(
     let current = tree.scan()?;
     for (path, access) in &current {
         ensure!(
-            access.is_public(user.uid, user.gid),
+            access.is_open(user.uid, user.gid),
             "file appeared or changed during session opening: {path:?}"
         );
     }

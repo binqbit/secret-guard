@@ -7,7 +7,7 @@ Secret Guard changes the owner and permissions of matching files in place. Their
 | State | Owner and group | Mode | Who can open the file |
 | --- | --- | --- | --- |
 | Locked | `root:root` | `0600` | Root can read and write. |
-| Unlocked | Opening user and their primary group | `0644` | The opening user can read and edit without sudo. Other users can read if they can traverse every parent directory. |
+| Unlocked | Opening user and their primary group | `0600` | The opening user can read and edit without sudo. Root can also read and write. |
 
 ## First-time setup
 
@@ -34,7 +34,7 @@ The default search root is **the whole home directory of the ordinary user who f
 
 The installed lists are system-wide. Normal use and binary upgrades preserve your edits. If an installed list is missing, restore it or explicitly reset all three lists to the packaged defaults. Only root can change the lists. Their paths, patterns and comments are public, so keep credential values in `.secrets/`.
 
-For example, with `/home/alice` as the search root, the default rules manage `/home/alice/project/.secrets/service-token` and skip `/home/alice/project/notes.txt`. Alice can unlock her token beneath her private `0700` home. A root-owned shared directory such as `/srv/projects` can also be a search root. Alice can manage her own `/srv/projects/api/.env` if she can traverse every parent directory. Other local users can read the unlocked file only if their permissions allow them to traverse its path. To narrow the search to one project, set its absolute path with `secret-guard config edit folders`. The walkthrough below uses `/srv/work/api`.
+For example, with `/home/alice` as the search root, the default rules manage `/home/alice/project/.secrets/service-token` and skip `/home/alice/project/notes.txt`. Alice can unlock her token beneath her private `0700` home. A root-owned shared directory such as `/srv/projects` can also be a search root. Alice can manage her own `/srv/projects/api/.env` if she can traverse every parent directory. In either location the unlocked file's `0600` mode denies access to other ordinary UIDs. To narrow the search to one project, set its absolute path with `secret-guard config edit folders`. The walkthrough below uses `/srv/work/api`.
 
 | Installed list | What to put in it | Example entries, one per line |
 | --- | --- | --- |
@@ -75,7 +75,7 @@ locked  0:0 0600  "/srv/work/api/.env"
 locked  0:0 0600  "/srv/work/api/.secrets/service.key"
 ```
 
-The first status line describes the session. Each file then gets a label (`locked`, `public-read mode` or `unmanaged or changed`), followed by its owner ID, group ID and mode. The `public-read mode` label describes the file mode. A user needs traversal permission on every parent directory to reach that file.
+The first status line describes the operation. Each file line shows an access label, owner ID, group ID and mode. `locked` marks a root-protected file. `owner-only mode` identifies an eligible file owned by the working user at `0600`. A file already at `0644`, including one opened by an older release, can appear as `public-read mode`. Other mismatches appear as `unmanaged or changed`.
 
 ### Reset the configuration
 
@@ -126,7 +126,7 @@ Here `alice` stands for your login name. For a project with an executable test s
 
 ## If a file is busy or the session stops
 
-If a process still has a matching file open or memory-mapped, Secret Guard locks the files it can and lists the paths still in use.
+Before converting a file with broader permissions, such as an existing `0644` `.env`, to owner-only access, Secret Guard checks for open handles and memory mappings. If a process holds the file, release it, finish any pending close and then retry the opening command. When closing access, Secret Guard locks the files it can and lists the paths still in use.
 
 ```text
 Files still in use:
@@ -148,8 +148,8 @@ A crash or power loss can leave files unlocked. Secret Guard records the opening
 ## Security model
 
 - **Who can unlock a file.** The ordinary sudo caller is the session user. On first use, a file must belong to that user. Secret Guard records their UID in a root-protected `trusted.secret_guard` attribute so it can recognize the file after taking ownership. It refuses unrelated root-owned files, files belonging to another user, hard-linked files and matching special files. From a root shell, specify the original ordinary account, for example `secret-guard --user alice lock`. [Linux extended attributes](https://man7.org/linux/man-pages/man7/xattr.7.html)
-- **What locking covers.** Secret Guard checks the file's identity beneath the configured root and takes an exclusive file lease when locking it. Someone who can write to a parent directory may still rename, replace or delete a locked file. Moving a file outside the selection takes it beyond the next scan. Files created after closure keep their creator's permissions until another lock. [Linux path resolution](https://man7.org/linux/man-pages/man2/openat2.2.html) · [Linux file leases](https://man7.org/linux/man-pages/man2/F_SETLEASE.2const.html)
-- **What happens to the data.** While a file is unlocked, processes running as the opening user and other accounts with access through its parent directories can read and copy it. Secret Guard provides no encryption, backups or secure erasure. Anyone with privileged or offline disk access can read the contents, and snapshots, backups or copies made while the files are open may retain them.
+- **What locking covers.** Secret Guard checks each file's identity beneath its search root and takes an exclusive lease when locking it. Someone who can write to a parent directory may rename, replace or delete a locked file. Moving a file outside the selection takes it beyond the next scan. New and replacement files keep the permissions chosen by their creator until Secret Guard next applies a permission change. Create credential files with mode `0600` (for example, set `umask 077` before creating them). [Linux path resolution](https://man7.org/linux/man-pages/man2/openat2.2.html) · [Linux file leases](https://man7.org/linux/man-pages/man2/F_SETLEASE.2const.html)
+- **What happens to the data.** The opening user owns the unlocked file and can change its permissions or share its contents. Any process running under that UID can read and copy it. Root retains access in both states. Secret Guard provides no encryption, backups or secure erasure. Offline disk access, snapshots, backups and copies made while the files are open may expose the contents.
 
 The CLI needs procfs and a local filesystem with trusted extended attributes, enabled file leases, and support for syncing files and directories. The root process needs permission to change ownership, write trusted attributes (`CAP_SYS_ADMIN`) and acquire leases (`CAP_LEASE`).
 
@@ -183,7 +183,9 @@ Git-aware workspace indexers skip build output, real environment files and `.sec
 Secret Guard selects files using the three installed lists. A real `.env` can therefore stay out of your workspace index and still appear in `sudo secret-guard status --paths`.
 
 <details>
-<summary>Upgrading from an older configuration or storage format</summary>
+<summary>Upgrading from an older access mode, configuration or storage format</summary>
+
+If your previous release opened secrets at `0644`, finish any supervised session and run `sudo secret-guard lock` as the account that opened them before upgrading. Reopen with `unlock` or `session` after installing this release. The files will then belong to the opening user at `0600`.
 
 If your installed lists use the old private permissions, finish any open session with the installed binary first. Review the lists for paths, patterns and public comments, then update their permissions in place before replacing the binary.
 

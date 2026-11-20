@@ -100,15 +100,6 @@ impl FileAccess {
         Ok(())
     }
 
-    pub fn validate_open(&self, uid: u32) -> Result<()> {
-        self.validate(uid)?;
-        ensure!(
-            self.acl_allows_public_read,
-            "an access ACL entry denies public read permission"
-        );
-        Ok(())
-    }
-
     pub fn is_locked(&self, uid: u32) -> bool {
         self.problem.is_none()
             && self.uid == 0
@@ -117,8 +108,16 @@ impl FileAccess {
             && self.marker_uid == Some(uid)
     }
 
+    pub fn is_open(&self, uid: u32, gid: u32) -> bool {
+        self.validate(uid).is_ok() && self.uid == uid && self.gid == gid && self.mode == 0o600
+    }
+
     pub fn is_public(&self, uid: u32, gid: u32) -> bool {
-        self.validate_open(uid).is_ok() && self.uid == uid && self.gid == gid && self.mode == 0o644
+        self.validate(uid).is_ok()
+            && self.uid == uid
+            && self.gid == gid
+            && self.mode == 0o644
+            && self.acl_allows_public_read
     }
 }
 
@@ -510,9 +509,6 @@ impl Tree {
             "file identity or permissions changed after scanning"
         );
         before.validate(self.uid)?;
-        if open {
-            before.validate_open(self.uid)?;
-        }
         let verify_name = |expected_uid: u32| -> Result<()> {
             check_root(root)?;
             let current =
@@ -527,12 +523,14 @@ impl Tree {
             Ok(())
         };
         verify_name(before.uid)?;
+        // Narrowing a previously shared file also requires the old readers to release it.
+        let require_lease = !open || before.mode & 0o077 != 0;
         let fd = match metadata_fd(&pinned) {
             Ok(fd) => fd,
-            Err(Errno::AGAIN) if !open => return Ok(Change::Busy),
+            Err(Errno::AGAIN) if require_lease => return Ok(Change::Busy),
             Err(e) => return Err(e).context("open the verified file for metadata changes"),
         };
-        if !open && (!take_exclusive_lease(&fd)? || !lease_is_exclusive(&fd)?) {
+        if require_lease && (!take_exclusive_lease(&fd)? || !lease_is_exclusive(&fd)?) {
             return Ok(Change::Busy);
         }
         if !open && before.is_locked(self.uid) {
@@ -549,20 +547,18 @@ impl Tree {
         }
 
         let restricted = Mode::RUSR | Mode::WUSR;
-        let wanted_mode = if open {
-            restricted | Mode::RGRP | Mode::ROTH
-        } else {
-            restricted
-        };
         let (wanted_uid, wanted_gid) = if open { (self.uid, gid) } else { (0, 0) };
         if before.uid != wanted_uid || before.gid != wanted_gid {
             // Finish the ownership transition in a restrictive mode. fchown also clears
             // executable privilege bits and file capabilities as specified by Linux.
-            if !open && !lease_is_exclusive(&fd)? {
+            if require_lease && !lease_is_exclusive(&fd)? {
                 return Ok(Change::Busy);
             }
             fs::fchmod(&fd, restricted)?;
             verify_name(before.uid)?;
+            if require_lease && !lease_is_exclusive(&fd)? {
+                return Ok(Change::Busy);
+            }
             fs::fchown(
                 &fd,
                 Some(Uid::from_raw(wanted_uid)),
@@ -570,11 +566,11 @@ impl Tree {
             )?;
         }
         verify_name(wanted_uid)?;
-        if fd.metadata()?.mode() & 0o7777 != wanted_mode.bits() {
-            if !open && !lease_is_exclusive(&fd)? {
+        if fd.metadata()?.mode() & 0o7777 != restricted.bits() {
+            if require_lease && !lease_is_exclusive(&fd)? {
                 return Ok(Change::Busy);
             }
-            fs::fchmod(&fd, wanted_mode)?;
+            fs::fchmod(&fd, restricted)?;
         }
         fd.sync_all()?;
         let parent = relative
@@ -586,13 +582,13 @@ impl Tree {
         let after = FileAccess::inspect(&pinned)?;
         ensure!(
             if open {
-                after.is_public(self.uid, gid)
+                after.is_open(self.uid, gid)
             } else {
                 after.is_locked(self.uid)
             },
             "file permissions did not reach the requested state"
         );
-        if !open && !lease_is_exclusive(&fd)? {
+        if require_lease && !lease_is_exclusive(&fd)? {
             return Ok(Change::Busy);
         }
         Ok(Change::Done)
@@ -686,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn kernel_acl_preserves_named_permissions_across_chmod() -> Result<()> {
+    fn owner_only_mode_masks_named_acl_entries_and_preserves_them() -> Result<()> {
         let root = tempfile::tempdir()?;
         let path = root.path().join(".env");
         let fd = File::create(&path)?;
@@ -700,18 +696,22 @@ mod tests {
             (32, 4, base),
         ];
         fs::fsetxattr(&fd, ACL, &fixture_acl(&entries), XattrFlags::empty())?;
-        fs::fchmod(&fd, Mode::RUSR | Mode::WUSR)?;
         let info = FileAccess::inspect(&fd)?;
-        info.validate_open(info.uid)?;
-        fs::fchmod(&fd, Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH)?;
-        assert!(FileAccess::inspect(&fd)?.is_public(info.uid, info.gid));
+        assert!(info.is_public(info.uid, info.gid));
+        assert!(!info.is_open(info.uid, info.gid));
         entries[1].1 = 0;
         fs::fsetxattr(&fd, ACL, &fixture_acl(&entries), XattrFlags::empty())?;
-        assert!(FileAccess::inspect(&fd)?.validate_open(info.uid).is_err());
-        entries[1].1 = 4;
-        entries[2].1 = 0;
-        fs::fsetxattr(&fd, ACL, &fixture_acl(&entries), XattrFlags::empty())?;
-        assert!(FileAccess::inspect(&fd)?.validate_open(info.uid).is_err());
+        assert!(!FileAccess::inspect(&fd)?.is_public(info.uid, info.gid));
+        fs::fchmod(&fd, Mode::RUSR | Mode::WUSR)?;
+        let private = FileAccess::inspect(&fd)?;
+        assert!(private.is_open(info.uid, info.gid));
+        assert!(!private.is_public(info.uid, info.gid));
+        // chmod preserved named read grants and denials, and masked every grant.
+        entries[4].1 = 0;
+        entries[5].1 = 0;
+        let mut actual = vec![0; fs::fgetxattr_query(&fd, ACL)?];
+        fs::fgetxattr(&fd, ACL, &mut actual[..])?;
+        assert_eq!(actual, fixture_acl(&entries));
         Ok(())
     }
 
@@ -773,11 +773,16 @@ mod tests {
         info.marker_uid = Some(2000);
         assert!(info.validate(1000).is_err());
         info.marker_uid = Some(1000);
-        info.validate_open(1000).unwrap();
-        assert!(info.is_locked(1000));
-        info.acl_allows_public_read = false;
         info.validate(1000).unwrap();
-        assert!(info.validate_open(1000).is_err());
+        assert!(info.is_locked(1000));
+        assert!(!info.is_open(1000, 1000));
+        info.uid = 1000;
+        info.gid = 1000;
+        info.acl_allows_public_read = false;
+        assert!(info.is_open(1000, 1000));
+        assert!(!info.is_open(1000, 2000));
+        assert!(!info.is_open(2000, 1000));
+        assert!(!info.is_locked(1000));
     }
 
     #[test]
@@ -829,6 +834,7 @@ mod tests {
         let path = root.path().join(".env");
         disk::write(&path, b"fixture")?;
         let reader = File::open(&path)?;
+        fs::fchmod(&reader, Mode::from_bits_retain(0o644))?;
         let uid = rustix::process::geteuid().as_raw();
         let gid = rustix::process::getegid().as_raw();
         let uid = if uid == 0 {
@@ -842,6 +848,10 @@ mod tests {
         let original = reader.metadata()?;
         assert_eq!(
             tree.set_access(&path, &before[&path], false, gid)?,
+            Change::Busy
+        );
+        assert_eq!(
+            tree.set_access(&path, &before[&path], true, gid)?,
             Change::Busy
         );
         assert_eq!(tree.scan()?, before);

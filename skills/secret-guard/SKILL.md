@@ -18,6 +18,6 @@ Read the installed rules in `/etc/secret-guard/` without sudo. Repository copies
 | --- | --- | --- |
 | Installed rule list (`root:root 0644`) | All local users | Root |
 | Locked (`root:root 0600`) | Root | Root |
-| Unlocked (opening user's UID and primary group, `0644`) | Root and users who can traverse the path | Opening user and root |
+| Unlocked (opening user's UID and primary group, `0600`) | Opening user and root | Opening user and root |
 
-Wait for `UNLOCKED` from an authorized `session` or manual `unlock`. Work as the opening user without sudo. Unlock preserves directory permissions, including `0700` on the opening user's home. Check `test -r "$path"` for reads or `test -w "$path"` for edits without printing the value. Release your file handles when finished. Close a manual unlock with `sudo secret-guard lock` as the opening user and confirm `LOCKED`.
+Wait for `UNLOCKED` from an authorized `session` or manual `unlock`. Work as the opening user without sudo. Processes under that UID share access. Unlock preserves directory permissions, including `0700` on the opening user's home. Check `test -r "$path"` for reads or `test -w "$path"` for edits without printing the value. Release your file handles when finished. Close a manual unlock with `sudo secret-guard lock` as the opening user and confirm `LOCKED`.

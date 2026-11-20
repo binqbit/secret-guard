@@ -34,6 +34,32 @@ rules=/etc/secret-guard
 as_reader() { setpriv --reuid=2000 --regid=2000 --clear-groups "$@"; }
 as_editor() { setpriv --reuid=1000 --regid=1000 --groups=3000 "$@"; }
 locked() { [ "$(stat -c '%u:%g:%a' "$1")" = '0:0:600' ]; }
+# Hold a real descriptor as the selected test account until the caller releases it.
+hold_file() {
+    holder_dir=$3
+    "$1" sh -eu -c '
+        exec 3<"$1"
+        : > "$2/reader-ready"
+        for attempt in $(seq 1 150); do
+            [ -e "$2/reader-release" ] && exit 0
+            sleep 0.1
+        done
+        exit 1
+    ' sh "$2" "$holder_dir" &
+    holder=$!
+    trap 'touch "$holder_dir/reader-release"; wait "$holder" || :' 0
+    for attempt in $(seq 1 100); do
+        [ -e "$holder_dir/reader-ready" ] && return 0
+        kill -0 "$holder" || return 1
+        sleep 0.1
+    done
+    return 1
+}
+release_file() {
+    touch "$holder_dir/reader-release"
+    wait "$holder"
+    trap - 0
+}
 editor_home='/var/lib/editor home'
 reader_home='/var/lib/reader home'
 install -d -o 1000 -g 1000 -m 0700 "$editor_home"
@@ -165,7 +191,7 @@ grep -F "$(printf '\033[31mLOCKED\033[0m')" private-tty.log >/dev/null
 locked "$home_env"
 "$guard" session -- /bin/sh -eu -c '
     [ "$(stat -c %a "$HOME")" = 700 ]
-    [ "$(stat -c "%u:%g:%a" "$HOME/.env")" = 1000:1000:644 ]
+    [ "$(stat -c "%u:%g:%a" "$HOME/.env")" = 1000:1000:600 ]
     [ "$(cat "$HOME/.env")" = "bootstrap fixture" ]
     printf "%s\n" "private session edit" > "$HOME/.env"
 '
@@ -173,9 +199,13 @@ locked "$home_env"
 if as_editor cat "$home_env" >/dev/null 2>&1; then echo 'Home secret still readable after session' >&2; exit 1; fi
 "$guard" unlock
 [ "$(as_editor cat "$home_env")" = 'private session edit' ]
-[ "$(stat -c '%u:%g:%a' "$home_env")" = '1000:1000:644' ]
+[ "$(stat -c '%u:%g:%a' "$home_env")" = '1000:1000:600' ]
 [ "$(stat -c '%u:%g:%a' "$editor_home")" = '1000:1000:700' ]
 if as_reader cat "$home_env" >/dev/null 2>&1; then echo 'Another UID traversed the private home' >&2; exit 1; fi
+# Keep the caller's private descriptor open while the CLI refreshes manual access.
+hold_file as_editor "$home_env" "$editor_home"
+"$guard" unlock
+release_file
 "$guard" lock
 locked "$home_env"
 if as_editor cat "$home_env" >/dev/null 2>&1; then echo 'Home secret still readable after manual lock' >&2; exit 1; fi
@@ -336,7 +366,27 @@ if command -v setfacl >/dev/null 2>&1; then
     echo 'PASS: rule file, directory and ancestor ACL checks'
 fi
 
+if command -v setfacl >/dev/null 2>&1; then
+    # An existing named read grant must be ineffective throughout an opening.
+    setfacl -m u:2000:r--,u:3000:--- .secrets/key
+    [ "$(as_reader cat "$work/.secrets/key")" = recursive ]
+fi
+# A reader can retain a descriptor to an older 0644 file even after chmod.
+legacy_file="$work/.env.legacy"
+reader_sync=/var/lib/sg-held-reader
+install -d -o 2000 -g 2000 -m 0700 "$reader_sync"
+printf '%s\n' 'legacy fixture' > "$legacy_file"
+chown 1000:1000 "$legacy_file"
+chmod 0644 "$legacy_file"
+hold_file as_reader "$legacy_file" "$reader_sync"
+if setsid --fork --wait "$guard" unlock </dev/null > held-unlock.log 2>&1; then
+    echo 'Unlocked a formerly public file while another user still held it open' >&2; exit 1
+fi
+grep -F "$legacy_file" held-unlock.log >/dev/null
+if grep -Fx UNLOCKED held-unlock.log >/dev/null; then echo 'Claimed owner-only access before closing existing handles' >&2; exit 1; fi
+release_file
 "$guard" lock
+locked "$legacy_file"
 locked .env && locked .secrets/key || exit 1
 if as_reader cat .env >/dev/null 2>&1; then echo 'Locked file is readable' >&2; exit 1; fi
 [ "$(stat -c '%u:%g:%a' target/.env)" = '1000:1000:640' ]
@@ -348,9 +398,13 @@ setsid --fork --wait "$guard" unlock </dev/null > unlock.out
 grep -Fx 'UNLOCKED' unlock.out >/dev/null
 "$guard" status > manual-status.out
 grep -F 'OPEN / manual' manual-status.out >/dev/null
-grep -Fx "public-read mode  1000:1000 0644  \"$work/.env\"" manual-status.out >/dev/null
+grep -Fx "owner-only mode  1000:1000 0600  \"$work/.env\"" manual-status.out >/dev/null
 if grep -F 'recovery required' manual-status.out >/dev/null; then echo 'Manual unlock reported as a crash' >&2; exit 1; fi
-[ "$(as_reader cat .env)" = before ]
+[ "$(as_editor cat "$work/.env")" = before ]
+[ "$(as_editor cat "$legacy_file")" = 'legacy fixture' ]
+if as_reader cat "$legacy_file" >/dev/null 2>&1; then echo 'Legacy fixture stayed readable after recovery' >&2; exit 1; fi
+if as_reader cat "$work/.env" >/dev/null 2>&1; then echo 'Reader can read after manual unlock' >&2; exit 1; fi
+if as_reader cat "$work/.secrets/key" >/dev/null 2>&1; then echo 'Named ACL grants read after unlock' >&2; exit 1; fi
 if as_reader sh -c ': >> .env' 2>/dev/null; then echo 'Reader can write after manual unlock' >&2; exit 1; fi
 if "$guard" session -- touch unexpected-session > rejected-session.log 2>&1; then echo 'Session took over manual unlock' >&2; exit 1; fi
 [ ! -e unexpected-session ]
@@ -371,7 +425,7 @@ chmod 0600 "$extra/.env"
 cp "$rules/.indexingfolders" before-manual-scope
 printf '%s\n' "$extra" > "$rules/.indexingfolders"
 "$guard" unlock >/dev/null
-[ "$(stat -c '%u:%g:%a' .env.manual)" = '1000:1000:644' ]
+[ "$(stat -c '%u:%g:%a' .env.manual)" = '1000:1000:600' ]
 "$guard" status > manual-scope.out
 grep -F "\"$work/.env\"" manual-scope.out >/dev/null
 if grep -F "\"$extra/.env\"" manual-scope.out >/dev/null; then echo 'Manual status lost original scope' >&2; exit 1; fi
@@ -422,9 +476,11 @@ grep -Fx "$work" "$rules/.indexingfolders" >/dev/null
 [ "$(stat -c '%u:%g:%a' /var/lib/secret-guard)" = '0:0:700' ]
 locked /var/lib/secret-guard/session.json
 if as_reader cat /var/lib/secret-guard/session.json >/dev/null 2>&1; then echo 'Reader can read private journal' >&2; exit 1; fi
-[ "$(stat -c '%u:%g:%a' .env)" = '1000:1000:644' ]
-[ "$(as_reader cat .env)" = edited ]
-[ "$(as_reader cat .secrets/key)" = recursive ]
+[ "$(stat -c '%u:%g:%a' .env)" = '1000:1000:600' ]
+[ "$(as_editor cat "$work/.env")" = edited ]
+[ "$(as_editor cat "$work/.secrets/key")" = recursive ]
+if as_reader cat "$work/.env" >/dev/null 2>&1; then echo 'Reader can read during session' >&2; exit 1; fi
+if as_reader cat "$work/.secrets/key" >/dev/null 2>&1; then echo 'Named ACL grants read during session' >&2; exit 1; fi
 if as_reader sh -c 'echo changed >> .env' 2>/dev/null; then echo 'Reader can write' >&2; exit 1; fi
 touch finish
 wait "$supervisor"
@@ -466,5 +522,5 @@ chmod 0755 "$rules"
 locked .env.busy
 [ "$(cat .env.busy)" = 'held reader fixture' ]
 [ -z "$(find /var/lib/secret-guard -mindepth 1 -print -quit)" ]
-printf '%s\n' 'PASS: public reads, root-written rules, private journal, root-only locking, stable inode, edits, closing rescan, exclusions and busy-file recovery'
+printf '%s\n' 'PASS: owner-only reads, public configuration, private journal, root-only locking, stable inode, edits, closing rescan, exclusions and busy-file recovery'
 GUEST

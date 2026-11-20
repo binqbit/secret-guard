@@ -22,7 +22,7 @@ use tree::Tree;
 #[command(
     version,
     disable_help_subcommand = true,
-    about = "Switch local files between public-read and root-only permissions"
+    about = "Switch selected files between owner-only and root-only access"
 )]
 struct Cli {
     /// Select the ordinary account when invoking directly as root.
@@ -277,6 +277,8 @@ fn run(cli: Cli) -> Result<i32> {
             for (path, access) in tree.scan()? {
                 let label = if access.is_locked(user.uid) {
                     "locked"
+                } else if access.is_open(user.uid, user.gid) {
+                    "owner-only mode"
                 } else if access.is_public(user.uid, user.gid) {
                     "public-read mode"
                 } else {
