@@ -1,3 +1,4 @@
+//! Dispatch configuration commands and present installed rule lists.
 use std::env;
 use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
@@ -6,12 +7,14 @@ use std::process::Command;
 use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
 
-use crate::journal::{self, ConfigFiles, RuleList};
-use crate::sessions;
-use crate::{editor, runtime};
+use super::editor;
+use super::files::{self, ConfigFiles, initialize_if_needed};
+use super::rules::RuleList;
+use crate::journal::JournalStore;
+use crate::{runtime, session};
 
 #[derive(Subcommand)]
-pub enum Action {
+pub(crate) enum Action {
     /// Show all three lists, initializing the installed defaults on first use.
     Show,
     /// Replace all three installed lists with the packaged defaults for your account.
@@ -58,9 +61,9 @@ fn reset(selected_user: Option<&str>) -> Result<i32> {
         return run_with_sudo(selected_user, &["reset"]);
     }
     let user = runtime::resolve_user(selected_user)?;
-    let store = journal::JournalStore::open()?;
-    let _admission = store.admission()?;
-    if let Some(entry) = sessions::operations(&store)?.first() {
+    let store = JournalStore::open()?;
+    let admission = store.admission()?;
+    if let Some(entry) = session::operations(&store)?.first() {
         let label = entry.slot.label(entry.root());
         ensure!(
             entry.idle,
@@ -72,24 +75,28 @@ fn reset(selected_user: Option<&str>) -> Result<i32> {
         } else {
             "an unfinished operation needs recovery"
         };
-        let hint = sessions::close_hint(&entry.slot, entry.root());
+        let hint = entry.slot.close_hint(entry.root());
         bail!("session {label}: {state}. {hint}");
     }
-    journal::reset_config(&user.home)?;
-    println!("Restored the three installed rule lists to their packaged defaults.");
+    files::reset_config(&user.home)?;
+    drop(admission);
+    writeln!(
+        io::stdout().lock(),
+        "Restored the three installed rule lists to their packaged defaults."
+    )?;
     Ok(0)
 }
 
-pub fn run(action: Action, selected_user: Option<&str>) -> Result<i32> {
+pub(crate) fn run(action: Action, selected_user: Option<&str>) -> Result<i32> {
     let (list, editor) = match action {
         Action::Reset => return reset(selected_user),
         Action::Show => {
-            if journal::is_uninitialized()? {
+            if files::is_uninitialized()? {
                 if !rustix::process::geteuid().is_root() {
                     return run_with_sudo(selected_user, &["show"]);
                 }
                 let user = runtime::resolve_user(selected_user)?;
-                journal::initialize_if_needed(&user.home)?;
+                initialize_if_needed(&user.home)?;
             }
             show()?;
             return Ok(0);
@@ -111,15 +118,15 @@ pub fn run(action: Action, selected_user: Option<&str>) -> Result<i32> {
         return run_with_sudo(selected_user, &args);
     }
     let user = runtime::resolve_user(selected_user)?;
-    journal::initialize_if_needed(&user.home)?;
+    initialize_if_needed(&user.home)?;
     let original = ConfigFiles::open()?.read(list)?;
     if let Some(edited) =
         editor::edit_text(&user, list.filename(), &original, preferred.as_deref())?
     {
         ConfigFiles::open()?.replace(list, &original, &edited)?;
-        println!("Saved {}.", list.filename());
+        writeln!(io::stdout().lock(), "Saved {}.", list.filename())?;
     } else {
-        println!("No changes to {}.", list.filename());
+        writeln!(io::stdout().lock(), "No changes to {}.", list.filename())?;
     }
     Ok(0)
 }

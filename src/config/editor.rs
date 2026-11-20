@@ -1,3 +1,4 @@
+//! Edit rule lists in a private draft owned by the ordinary user.
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -73,7 +74,7 @@ fn remove_drafts(outer: &TempDir, directory: &File) -> Result<()> {
     Ok(())
 }
 
-pub fn edit_text(
+pub(super) fn edit_text(
     user: &User,
     list_name: &str,
     contents: &str,
@@ -129,7 +130,8 @@ pub fn edit_text(
         Ok((edited != contents).then_some(edited))
     })();
     if let Err(error) = remove_drafts(&outer, &directory) {
-        eprintln!(
+        let _ = writeln!(
+            std::io::stderr().lock(),
             "Could not clean up editor scratch directory {:?}: {error:#}",
             outer.path()
         );

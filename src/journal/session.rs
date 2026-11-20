@@ -1,20 +1,13 @@
-//! Only operation metadata is persisted. The filesystem is the source of truth for file access.
-use std::{collections::BTreeMap, path::PathBuf};
-
-use anyhow::{Context, Result, bail, ensure};
-use rustix::fs::Access;
+//! Versioned session metadata and durable phase transitions.
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    Scope,
-    journal::JournalStore,
-    runtime::{self, SessionSignals, User},
-    tree::{Change, FileAccess, Tree},
-};
+use super::JournalStore;
+use crate::{config::Scope, runtime::User, tree::Tree};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Phase {
+pub(crate) enum Phase {
     Opening,
     Running,
     Closing,
@@ -25,37 +18,37 @@ pub enum Phase {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Session {
+pub(crate) struct Session {
     version: u32,
-    pub phase: Phase,
-    pub user: String,
-    pub uid: u32,
-    pub pid: u32,
+    pub(crate) phase: Phase,
+    pub(crate) user: String,
+    pub(crate) uid: u32,
+    pub(crate) pid: u32,
     scope: Scope,
     roots: Vec<(u64, u64)>,
 }
 
 impl Session {
-    pub fn scope(&self) -> &Scope {
+    pub(crate) fn scope(&self) -> &Scope {
         &self.scope
     }
 
-    pub fn root_ids(&self) -> &[(u64, u64)] {
+    pub(crate) fn root_ids(&self) -> &[(u64, u64)] {
         &self.roots
     }
 
-    pub fn manual_scope(&self) -> Option<&Scope> {
+    pub(crate) fn manual_scope(&self) -> Option<&Scope> {
         match self.phase {
             Phase::ManualOpening | Phase::Manual | Phase::ManualClosing => Some(self.scope()),
             Phase::Opening | Phase::Running | Phase::Closing => None,
         }
     }
 
-    pub fn is_manual_open(&self) -> bool {
+    pub(crate) fn is_manual_open(&self) -> bool {
         matches!(self.phase, Phase::Manual)
     }
 
-    pub fn start(
+    pub(crate) fn start(
         store: &JournalStore,
         tree: &Tree,
         user: &User,
@@ -75,10 +68,15 @@ impl Session {
         Ok(session)
     }
 
-    pub fn validate(&self, tree: &Tree, uid: u32, scope: &Scope) -> Result<()> {
+    pub(crate) fn validate(&self, tree: &Tree, uid: u32, scope: &Scope) -> Result<()> {
         ensure!(self.version == 3, "unsupported session journal version");
         ensure!(
-            self.uid == uid && self.scope == *scope,
+            self.uid == uid,
+            "session belongs to UID {}; recover it as the original user",
+            self.uid
+        );
+        ensure!(
+            self.scope == *scope,
             "restore the original session user, roots and selection rules before recovery"
         );
         ensure!(
@@ -88,7 +86,7 @@ impl Session {
         Ok(())
     }
 
-    pub fn phase(&mut self, store: &JournalStore, phase: Phase) -> Result<()> {
+    pub(crate) fn phase(&mut self, store: &JournalStore, phase: Phase) -> Result<()> {
         self.phase = phase;
         self.pid = std::process::id();
         if let Err(error) = store.save(self) {
@@ -102,7 +100,9 @@ impl Session {
         Ok(())
     }
 
-    pub fn begin_close(&mut self, store: &JournalStore) -> Result<()> {
+    /// Record the closing phase. `Ok(Some(error))` allows relocking when the
+    /// preceding phase already requires recovery and the new write failed.
+    pub(crate) fn begin_close(&mut self, store: &JournalStore) -> Result<Option<anyhow::Error>> {
         let was_manually_open = self.is_manual_open();
         let closing = if self.manual_scope().is_some() {
             Phase::ManualClosing
@@ -116,95 +116,10 @@ impl Session {
                 return Err(error).context("record closing of manually unlocked files");
             }
             // All other journal phases already require recovery if the owner exits.
-            eprintln!("Could not update the closing phase before locking: {error:#}");
+            return Ok(Some(error));
         }
-        Ok(())
+        Ok(None)
     }
-}
-
-pub fn preflight(tree: &Tree, user: &User) -> Result<BTreeMap<PathBuf, FileAccess>> {
-    let files = tree.scan()?;
-    for (path, access) in &files {
-        access
-            .validate(user.uid)
-            .with_context(|| format!("cannot open {path:?}"))?;
-    }
-    runtime::check_file_access(user, &files, Access::EXISTS)?;
-    Ok(files)
-}
-
-pub fn open_files(
-    tree: &Tree,
-    user: &User,
-    files: &BTreeMap<PathBuf, FileAccess>,
-    interrupted: impl Fn() -> bool,
-) -> Result<()> {
-    for (path, access) in files {
-        ensure!(!interrupted(), "session opening interrupted");
-        let change = tree
-            .set_access(path, access, true, user.gid)
-            .with_context(|| format!("cannot open {path:?}"))?;
-        ensure!(
-            matches!(change, Change::Done),
-            "file is in use and could not be opened: {path:?}"
-        );
-    }
-    let current = tree.scan()?;
-    for (path, access) in &current {
-        ensure!(
-            access.is_open(user.uid, user.gid),
-            "file appeared or changed during session opening: {path:?}"
-        );
-    }
-    runtime::check_file_access(user, &current, Access::READ_OK | Access::WRITE_OK)
-}
-
-/// Closing starts with a fresh scan so new files and editor replacements get locked too.
-pub fn close(
-    tree: &Tree,
-    user: &User,
-    signals: &SessionSignals,
-    check_other_sessions: impl Fn() -> Result<()>,
-) -> Result<()> {
-    loop {
-        check_other_sessions()?;
-        let pending = close_pass(tree, user)?;
-        if pending.is_empty() {
-            return Ok(());
-        }
-        signals.wait_for_retry(&pending)?;
-    }
-}
-
-fn close_pass(tree: &Tree, user: &User) -> Result<Vec<PathBuf>> {
-    let mut busy = std::collections::BTreeSet::new();
-    let mut failures = Vec::new();
-    for (path, access) in tree.scan()? {
-        match tree.set_access(&path, &access, false, user.gid) {
-            Ok(Change::Done) => (),
-            Ok(Change::Busy) => {
-                busy.insert(path);
-            }
-            Err(e) => failures.push(format!("{path:?}: {e:#}")),
-        }
-    }
-    if !failures.is_empty() {
-        failures.extend(busy.iter().map(|path| format!("{path:?}: still in use")));
-        bail!("could not lock all files:\n{}", failures.join("\n"));
-    }
-
-    let mut pending = Vec::new();
-    for (path, access) in tree.scan()? {
-        if busy.contains(&path) {
-            pending.push(path);
-        } else {
-            ensure!(
-                access.is_locked(user.uid),
-                "file appeared or changed during closing: {path:?}; retry lock"
-            );
-        }
-    }
-    Ok(pending)
 }
 
 #[cfg(test)]
@@ -248,7 +163,7 @@ mod tests {
             assert_eq!(saved.is_manual_open(), matches!(phase, Phase::Manual));
         }
         session.phase(&store, Phase::Manual)?;
-        session.begin_close(&store)?;
+        assert!(session.begin_close(&store)?.is_none());
         let closing: Session = store.load()?.unwrap();
         assert!(matches!(closing.phase, Phase::ManualClosing));
         assert!(closing.validate(&tree, uid + 1, &scope).is_err());
@@ -261,9 +176,19 @@ mod tests {
         session.phase(&store, Phase::ManualOpening)?;
         assert!(session.phase(&reader, Phase::Manual).is_err());
         assert!(matches!(session.phase, Phase::ManualOpening));
-        session.begin_close(&reader)?;
+        let warning = session
+            .begin_close(&reader)?
+            .expect("report the failed phase write");
+        assert!(warning.to_string().contains("exclusive state lock"));
+        assert!(matches!(session.phase, Phase::ManualOpening));
         session.phase(&store, Phase::Manual)?;
-        assert!(session.begin_close(&reader).is_err());
+        let error = session
+            .begin_close(&reader)
+            .expect_err("a manual session needs a durable closing phase");
+        assert_eq!(
+            error.to_string(),
+            "record closing of manually unlocked files"
+        );
         assert!(session.is_manual_open());
 
         std::fs::rename(&root, workspace.path().join("original"))?;

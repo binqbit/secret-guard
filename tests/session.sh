@@ -77,7 +77,7 @@ fi
 if command -v setfacl >/dev/null 2>&1; then
     setfacl -m d:u:2000:--- /etc
 fi
-(umask 0077; HOME=/root USER=root LOGNAME=root "$guard" config show) > first-show.out
+(umask 0177; HOME=/root USER=root LOGNAME=root "$guard" config show) > first-show.out
 [ "$(stat -c '%u:%g:%a' "$rules")" = '0:0:755' ]
 grep -Fx "$editor_home" "$rules/.indexingfolders" >/dev/null
 cmp "$templates/.indexingsecrets" "$rules/.indexingsecrets"
@@ -106,7 +106,8 @@ mv "$rules" /etc/reader-defaults
 printf '%s\n' 'bootstrap fixture' > "$editor_home/.env"
 chown 1000:1000 "$editor_home/.env"
 chmod 0644 "$editor_home/.env"
-HOME=/root "$guard" status > first-status.out
+(umask 0177; HOME=/root "$guard" status) > first-status.out
+[ "$(stat -c '%u:%g:%a' /var/lib/secret-guard)" = '0:0:700' ]
 grep -Fx 'No open session.' first-status.out >/dev/null
 grep -Fx "public-read mode  1000:1000 0644  \"$editor_home/.env\"" first-status.out >/dev/null
 "$guard" status --paths > first-paths.out
@@ -554,9 +555,23 @@ reject_scope() {
         exit 1
     fi
 }
+wait_for_text() {
+    for attempt in $(seq 1 100); do
+        grep -F "$1" "$2" >/dev/null 2>&1 && return 0
+        sleep 0.1
+    done
+    echo "Timed out waiting for '$1' in $2" >&2
+    return 1
+}
 # The explicit root only needs the secret and ignore lists.
 mv "$rules/.indexingfolders" named-unused-folders
-"$guard" lock service-api --path "$api"
+if setsid --fork --wait "$guard" session unused-headless --path "$api" </dev/null > headless.out 2>&1; then
+    echo 'Interactive session started without a controlling terminal' >&2; exit 1
+fi
+[ ! -e /var/lib/secret-guard/named-unused-headless ]
+untouched "$api/.env"
+(umask 0177; "$guard" lock service-api --path "$api")
+[ "$(stat -c '%u:%g:%a' /var/lib/secret-guard/named-service-api)" = '0:0:700' ]
 "$guard" status service-api --paths > api-paths.out
 mv named-unused-folders "$rules/.indexingfolders"
 "$guard" lock service-web --path "$web"
@@ -758,6 +773,38 @@ untouched "$selected/.env.deferred"
 locked "$selected/.env.deferred"
 echo 'PASS: explicit root precedence, inner exclusions, saved selection and earlier journal recovery'
 
+# Catch duplicate physical roots at admission, before enrolling any files.
+physical="$projects/physical"
+install -d -o 1000 -g 1000 -m 0755 "$physical"
+as_editor sh -c 'umask 027; : > "$1"' sh "$physical/.env"
+mount -n --bind "$physical" "$alias_dir"
+printf '%s\n' "$physical" "$alias_dir" > "$rules/.indexingfolders"
+printf '%s\n' '.env' > "$rules/.indexingsecrets"
+: > "$rules/.indexingignore"
+reject_scope lock
+grep -F 'overlapping roots' scope-rejected.log >/dev/null
+untouched "$physical/.env"
+[ ! -e /var/lib/secret-guard/session.json ]
+# Older releases could record both views of the same directory in one journal.
+(umask 077; printf '{"version":3,"phase":"manual","user":"editor","uid":1000,"pid":1,"scope":{"roots":["%s","%s"],"patterns":[".env"],"ignores":[]},"roots":[[%s],[%s]]}\n' \
+    "$physical" "$alias_dir" "$(stat -c '%d,%i' "$physical")" "$(stat -c '%d,%i' "$alias_dir")" \
+    > /var/lib/secret-guard/session.json)
+"$guard" unlock
+opened "$physical/.env"
+"$guard" lock
+locked "$physical/.env"
+[ ! -e /var/lib/secret-guard/session.json ]
+umount -n "$alias_dir"
+for reserved in "$rules" /var/lib/secret-guard; do
+    mount -n --bind "$reserved" "$alias_dir"
+    reject_scope status "$alias_dir" --paths
+    grep -F 'configuration or state' scope-rejected.log >/dev/null
+    umount -n "$alias_dir"
+done
+"$guard" lock "$physical"
+locked "$physical/.env"
+echo 'PASS: physical root admission, reserved directories and recovery of older aliased scopes'
+
 # An interrupted sync can leave the new marker or permissions visible. Inject
 # errors only into fsync of the fixture or its parent, and retry the same journal.
 if command -v strace >/dev/null 2>&1; then
@@ -787,4 +834,26 @@ if command -v strace >/dev/null 2>&1; then
     test ! -e "$sync_journal"
     echo 'PASS: retry enrollment, file and directory sync before clearing the journal'
 fi
+
+# Output may block after config reset. The new rules must already be usable.
+reset_pipe="$projects/reset-output"
+mkfifo "$reset_pipe"
+exec 4<>"$reset_pipe"
+if dd if=/dev/zero of="$reset_pipe" bs=1 count=2097152 oflag=nonblock status=none 2>/dev/null; then
+    echo 'Did not fill the config output pipe' >&2; exit 1
+fi
+"$guard" config reset > "$reset_pipe" &
+reset_pid=$!
+trap 'kill "$reset_pid" 2>/dev/null || :; wait "$reset_pid" || :' 0
+wait_for_text "$editor_home" "$rules/.indexingfolders"
+kill -0 "$reset_pid"
+status_code=0
+timeout 5 "$guard" status --paths > during-reset.out || status_code=$?
+dd if="$reset_pipe" of=/dev/null bs=4096 count=1 status=none
+wait "$reset_pid"
+exec 4>&-
+trap - 0
+[ "$status_code" -eq 0 ]
+grep -Fx "\"$home_env\"" during-reset.out >/dev/null
+echo 'PASS: stalled config output releases admission before another command reads the reset rules'
 GUEST

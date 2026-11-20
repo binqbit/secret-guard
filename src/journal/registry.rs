@@ -1,3 +1,4 @@
+//! Admit operations and resolve named bindings and directory slots.
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{ErrorKind, Write};
@@ -9,7 +10,8 @@ use rustix::fs::{self, AtFlags, Dir, FlockOperation, Gid, Mode, Uid};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
-use super::{JournalStore, directory_flags};
+use super::JournalStore;
+use crate::storage::directory_flags;
 use crate::tree::descriptor_path;
 
 const ADMISSION: &str = ".admission.lock";
@@ -21,7 +23,7 @@ fn direct_entry((dev, ino): (u64, u64)) -> String {
     format!("{DIRECT_PREFIX}{dev:016x}-{ino:016x}")
 }
 
-pub fn validate_session_name(name: &str) -> Result<()> {
+pub(crate) fn validate_session_name(name: &str) -> Result<()> {
     ensure!(
         (1..=64).contains(&name.len())
             && name
@@ -38,9 +40,9 @@ pub fn validate_session_name(name: &str) -> Result<()> {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Binding {
-    pub uid: u32,
-    pub path: PathBuf,
+pub(crate) struct Binding {
+    pub(crate) uid: u32,
+    pub(crate) path: PathBuf,
 }
 
 impl Binding {
@@ -89,7 +91,7 @@ impl JournalStore {
 
     /// Serializes conflict checks and publication of each operation's first journal.
     /// Each caller opens the same inode with a separate open file description.
-    pub fn admission(&self) -> Result<File> {
+    pub(crate) fn admission(&self) -> Result<File> {
         let guard = match self.file(ADMISSION)? {
             Some(file) => file,
             None => {
@@ -112,12 +114,12 @@ impl JournalStore {
         }
     }
 
-    pub fn named(&self, name: &str, create: bool) -> Result<Option<Self>> {
+    pub(crate) fn named(&self, name: &str, create: bool) -> Result<Option<Self>> {
         validate_session_name(name)?;
         self.slot(&format!("{NAMED_PREFIX}{name}"), create)
     }
 
-    pub fn direct(&self, root_id: (u64, u64), create: bool) -> Result<Option<Self>> {
+    pub(crate) fn direct(&self, root_id: (u64, u64), create: bool) -> Result<Option<Self>> {
         self.slot(&direct_entry(root_id), create)
     }
 
@@ -147,7 +149,7 @@ impl JournalStore {
         Ok(names)
     }
 
-    pub fn names(&self) -> Result<Vec<String>> {
+    pub(crate) fn names(&self) -> Result<Vec<String>> {
         let names = self.entries(NAMED_PREFIX)?;
         for name in &names {
             validate_session_name(name)?;
@@ -155,7 +157,7 @@ impl JournalStore {
         Ok(names)
     }
 
-    pub fn direct_ids(&self) -> Result<Vec<(u64, u64)>> {
+    pub(crate) fn direct_ids(&self) -> Result<Vec<(u64, u64)>> {
         self.entries(DIRECT_PREFIX)?
             .into_iter()
             .map(|suffix| {
@@ -174,7 +176,7 @@ impl JournalStore {
 
     /// After an operation finishes, the caller holds admission and the same slot
     /// lock. rmdir also fails safely if any journal or pending write remains.
-    pub fn remove_direct(&self, root_id: (u64, u64), store: &Self) -> Result<()> {
+    pub(crate) fn remove_direct(&self, root_id: (u64, u64), store: &Self) -> Result<()> {
         store.require_lock()?;
         let entry = direct_entry(root_id);
         let actual = fs::statat(&self.directory, entry.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
@@ -190,7 +192,7 @@ impl JournalStore {
             .context("sync path session removal")
     }
 
-    pub fn binding(&self) -> Result<Option<Binding>> {
+    pub(crate) fn binding(&self) -> Result<Option<Binding>> {
         let Some(file) = self.file(BINDING)? else {
             return Ok(None);
         };
@@ -199,13 +201,16 @@ impl JournalStore {
         Ok(Some(binding))
     }
 
-    pub fn bind_if_absent(&self, binding: &Binding) -> Result<()> {
+    pub(crate) fn bind_if_absent(&self, binding: &Binding) -> Result<()> {
         self.require_lock()?;
         binding.validate()?;
-        if self.binding()?.is_none() {
-            self.publish_once(BINDING, &serde_json::to_vec(binding)?)?;
-        }
-        let saved = self.binding()?.context("missing session binding")?;
+        let saved = match self.binding()? {
+            Some(saved) => saved,
+            None => {
+                self.publish_once(BINDING, &serde_json::to_vec(binding)?)?;
+                self.binding()?.context("missing session binding")?
+            }
+        };
         ensure!(
             saved == *binding,
             "this name is bound to {:?} for UID {}",

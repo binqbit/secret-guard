@@ -53,7 +53,7 @@ secret-guard config edit ignore --editor nano
 
 Keep the directory owned by `root:root` with mode `0755` and each list owned by `root:root` with mode `0644`. Blank lines and whole-line `#` comments are ignored. Enter paths with spaces without quotes. Supply at least one root and one secret rule. The ignore list may be empty.
 
-Roots cannot overlap each other or the configuration and state directories. Use absolute paths without symlinks or `..`. The filesystem root (`/`) is refused. A name such as `.env` matches at any depth. A pattern such as `config/*.key` matches relative to each root. Scans skip symlinks and nested mounts. To scan a mounted project, list its mount point as a separate, non-overlapping root.
+Roots cannot overlap each other or the configuration and state directories, including through bind mounts. Use absolute paths without symlinks or `..`. The filesystem root (`/`) is refused. A name such as `.env` matches at any depth. A pattern such as `config/*.key` matches relative to each root. Scans skip symlinks and nested mounts. To scan a mounted project, list its mount point as a separate, non-overlapping root.
 
 The entries below illustrate how to exclude files and directory trees in `.indexingignore`. Each relative entry is interpreted from **each selected search root**. Paths starting with `./` or `/` are literal, so characters such as `*` and `[` in those paths refer to the filename itself. An absolute exclusion never adds a directory to the search.
 
@@ -199,6 +199,14 @@ install -D -m 0644 skills/secret-guard/SKILL.md "${CODEX_HOME:-$HOME/.codex}/ski
 Start a new Codex session. The skill is available for credential and environment configuration tasks. You can also invoke it explicitly, for example, `$secret-guard Configure the client to read its service token from a file.`
 
 ## Development and workspace indexing
+
+| Rust module | Where to make a change |
+| --- | --- |
+| [config](src/config/mod.rs) | Installed rule lists, packaged defaults and the `config` commands. |
+| [session](src/session/mod.rs) | Session selection, conflict handling, status and the open/close lifecycle. |
+| [journal](src/journal/mod.rs) | Session records, atomic writes, directory locks and saved name bindings. |
+| [tree](src/tree/mod.rs) | Search roots, rule matching, mount boundaries, ACLs and file permissions. |
+| [runtime](src/runtime/mod.rs) | User lookup, privilege changes, command execution, signals and terminal interaction. |
 
 ```sh
 cargo fmt --check

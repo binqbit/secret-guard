@@ -4,13 +4,11 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 
-use crate::state::Session;
-use crate::tree::{Root, Tree, check_root, descriptor_path};
+use super::{Root, Tree, descriptor_path, root::RESERVED_ROOTS};
 
 const MOUNTINFO: &str = "/proc/self/mountinfo";
 
@@ -85,55 +83,143 @@ impl Location {
         self.filesystem == other.filesystem
             && nested(&self.within_filesystem, &other.within_filesystem)
     }
+
+    fn reserved(path: &Path, table: &[u8]) -> Result<Self> {
+        // Config editing can precede state initialization. Locate the eventual
+        // directory inside its parent's filesystem without creating it.
+        match Root::open(path) {
+            Ok(root) => Self::pinned(&root, table),
+            Err(rustix::io::Errno::NOENT) => {
+                let parent = path.parent().context("missing filesystem root")?;
+                let mut location = Self::reserved(parent, table)?;
+                location
+                    .within_filesystem
+                    .push(path.file_name().context("missing directory name")?);
+                Ok(location)
+            }
+            Err(error) => Err(error).with_context(|| format!("open reserved directory {path:?}")),
+        }
+    }
 }
 
 fn nested(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
-pub fn check_disjoint(tree: &Tree, other: &Session) -> Result<()> {
-    let saved = Root::open_list(&other.scope().roots)
-        .context("reopen the other session's original roots")?;
-    ensure!(
-        saved.len() == other.root_ids().len(),
-        "invalid saved session root count"
-    );
-    let candidate_ids = tree.root_ids()?;
-    let table = fs::read(MOUNTINFO).context("read mount table for session overlap check")?;
-    let candidates = tree
-        .roots()
+struct LocatedRoot<'a> {
+    root: &'a Root,
+    id: (u64, u64),
+    location: Location,
+}
+
+impl<'a> LocatedRoot<'a> {
+    fn new(root: &'a Root, table: &[u8]) -> Result<Self> {
+        Ok(Self {
+            root,
+            id: root.verified_id()?,
+            location: Location::pinned(root, table)?,
+        })
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        nested(&self.root.path, &other.root.path)
+            || self.id == other.id
+            || self.location.overlaps(&other.location)
+    }
+}
+
+fn locate<'a>(roots: &'a [Root], table: &[u8]) -> Result<Vec<LocatedRoot<'a>>> {
+    roots
         .iter()
-        .map(|root| Location::pinned(root, &table))
-        .collect::<Result<Vec<_>>>()?;
-    for (peer, &id) in saved.iter().zip(other.root_ids()) {
-        let metadata = peer.fd.metadata()?;
-        ensure!(
-            (metadata.dev(), metadata.ino()) == id,
-            "restore the other session's original root directory: {:?}",
-            peer.path
-        );
-        let location = Location::pinned(peer, &table)?;
-        for ((root, candidate_id), candidate) in
-            tree.roots().iter().zip(&candidate_ids).zip(&candidates)
-        {
+        .map(|root| LocatedRoot::new(root, table))
+        .collect()
+}
+
+fn read_mounts() -> Result<Vec<u8>> {
+    fs::read(MOUNTINFO).context("read mount table for root overlap check")
+}
+
+fn verify_mounts(table: &[u8]) -> Result<()> {
+    ensure!(
+        read_mounts()? == table,
+        "mounts changed during root overlap check; retry the command"
+    );
+    Ok(())
+}
+
+fn validate_roots(roots: &[Root], require_disjoint: bool) -> Result<()> {
+    let table = read_mounts()?;
+    let candidates = locate(roots, &table)?;
+    for reserved in RESERVED_ROOTS.map(Path::new) {
+        let area = Location::reserved(reserved, &table)?;
+        for candidate in &candidates {
             ensure!(
-                !nested(&peer.path, &root.path)
-                    && id != *candidate_id
-                    && !location.overlaps(candidate),
-                "session roots overlap: {:?} and {:?}",
-                root.path,
-                peer.path
+                !candidate.location.overlaps(&area),
+                "root {:?} overlaps Secret Guard configuration or state: {reserved:?}",
+                candidate.root.path
             );
         }
     }
-    for root in saved.iter().chain(tree.roots()) {
-        check_root(root)?;
+    if require_disjoint {
+        for (i, candidate) in candidates.iter().enumerate() {
+            for peer in &candidates[..i] {
+                ensure!(
+                    !candidate.overlaps(peer),
+                    "overlapping roots: {:?} and {:?}",
+                    candidate.root.path,
+                    peer.root.path
+                );
+            }
+        }
     }
-    ensure!(
-        fs::read(MOUNTINFO)? == table,
-        "mounts changed during session overlap check; retry the command"
-    );
-    Ok(())
+    for root in roots {
+        root.verified_id()?;
+    }
+    verify_mounts(&table)
+}
+
+pub(crate) fn check_configured_roots(roots: &[Root]) -> Result<()> {
+    validate_roots(roots, true)
+}
+
+pub(crate) fn check_selection(tree: &Tree) -> Result<()> {
+    check_configured_roots(tree.roots())
+}
+
+pub(crate) fn check_protected_roots(tree: &Tree) -> Result<()> {
+    // An older journal can contain aliases of its own roots. Let it recover
+    // its files while enforcing the config/state boundary on every saved root.
+    validate_roots(tree.roots(), false)
+}
+
+pub(crate) fn overlapping_roots(
+    tree: &Tree,
+    paths: &[PathBuf],
+    ids: &[(u64, u64)],
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    let saved = Root::open_list(paths).context("reopen the other session's original roots")?;
+    ensure!(saved.len() == ids.len(), "invalid saved session root count");
+    let table = read_mounts()?;
+    let candidates = locate(tree.roots(), &table)?;
+    let mut overlap = None;
+    for (peer, &id) in saved.iter().zip(ids) {
+        let located = LocatedRoot::new(peer, &table)?;
+        ensure!(
+            located.id == id,
+            "restore the other session's original root directory: {:?}",
+            peer.path
+        );
+        for candidate in &candidates {
+            if candidate.overlaps(&located) {
+                overlap.get_or_insert_with(|| (candidate.root.path.clone(), peer.path.clone()));
+            }
+        }
+    }
+    for root in saved.iter().chain(tree.roots()) {
+        root.verified_id()?;
+    }
+    verify_mounts(&table)?;
+    Ok(overlap)
 }
 
 #[cfg(test)]
@@ -149,17 +235,14 @@ mod tests {
         fs::create_dir(&sibling)?;
         let tree = |path: &Path| Tree::new(&[path.into()], &[".env".into()], &[], 1000);
         let enrolled = tree(&project)?;
-        let operation: Session = serde_json::from_value(serde_json::json!({
-            "version": 3, "phase": "manual", "uid": 1000, "user": "editor", "pid": 1,
-            "scope": { "roots": [&project], "patterns": [".env"], "ignores": [] },
-            "roots": enrolled.root_ids()?,
-        }))?;
-        check_disjoint(&tree(&sibling)?, &operation)?;
-        assert!(check_disjoint(&tree(&project.join("sub"))?, &operation).is_err());
-        assert!(check_disjoint(&tree(temp.path())?, &operation).is_err());
+        let paths = std::slice::from_ref(&project);
+        let ids = enrolled.root_ids()?;
+        assert!(overlapping_roots(&tree(&sibling)?, paths, &ids)?.is_none());
+        assert!(overlapping_roots(&tree(&project.join("sub"))?, paths, &ids)?.is_some());
+        assert!(overlapping_roots(&tree(temp.path())?, paths, &ids)?.is_some());
         fs::rename(&project, temp.path().join("moved"))?;
         fs::create_dir(&project)?;
-        assert!(check_disjoint(&tree(&sibling)?, &operation).is_err());
+        assert!(overlapping_roots(&tree(&sibling)?, paths, &ids).is_err());
         Ok(())
     }
 
@@ -174,6 +257,20 @@ mod tests {
         let separate = Location::from_mount_info(table, 61, Path::new("/different/work/a b"))?;
         assert!(!parent.overlaps(&separate));
         assert!(Location::from_mount_info(table, 57, Path::new("/mnt/elsewhere")).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn reserved_location_exists_before_state_initialization() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("missing-parent/state");
+        let table = read_mounts()?;
+        let expected = Location::reserved(&path, &table)?;
+        assert!(!path.exists());
+        fs::create_dir_all(&path)?;
+        let actual = Location::pinned(&Root::open(&path)?, &table)?;
+        assert_eq!(actual.filesystem, expected.filesystem);
+        assert_eq!(actual.within_filesystem, expected.within_filesystem);
         Ok(())
     }
 
