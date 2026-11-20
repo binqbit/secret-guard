@@ -1,4 +1,5 @@
 //! Inspect a pinned file and change its ownership and mode under a file lease.
+
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
@@ -43,6 +44,7 @@ impl FileAccess {
             acl_allows_public_read: true,
             problem: None,
         };
+
         if !m.is_file() || m.nlink() != 1 {
             info.problem = Some(
                 if m.is_file() {
@@ -54,6 +56,7 @@ impl FileAccess {
             );
             return Ok(info);
         }
+
         let details = (|| -> Result<()> {
             let proc_path = descriptor_path(pinned);
             let mut marker = [0u8; 5];
@@ -68,6 +71,7 @@ impl FileAccess {
                         .context("read trusted ownership marker; trusted xattrs are required");
                 }
             }
+
             info.acl_allows_public_read = acl_allows_public_read(pinned)?;
             Ok(())
         })();
@@ -81,6 +85,7 @@ impl FileAccess {
         if let Some(issue) = &self.problem {
             anyhow::bail!("{issue}");
         }
+
         ensure!(
             self.marker_uid.is_none_or(|original| original == uid),
             "ownership marker belongs to a different user"
@@ -130,6 +135,7 @@ fn take_exclusive_lease(fd: &File) -> Result<bool> {
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETLEASE, libc::F_WRLCK) } == 0 {
         return Ok(true);
     }
+
     let error = std::io::Error::last_os_error();
     if error.kind() == std::io::ErrorKind::WouldBlock {
         return Ok(false);
@@ -160,6 +166,7 @@ impl Tree {
             self.uid != 0 && self.uid != u32::MAX && gid != u32::MAX,
             "invalid session identity"
         );
+
         root.verified_id()?;
         let pinned = root.open_beneath(relative, OFlags::PATH | OFlags::NOFOLLOW)?;
         let before = FileAccess::inspect(&pinned)?;
@@ -179,6 +186,7 @@ impl Tree {
             );
         }
         before.validate(self.uid)?;
+
         let verify_name = |expected_uid: u32| -> Result<()> {
             root.verified_id()?;
             let current = root
@@ -193,6 +201,7 @@ impl Tree {
             );
             Ok(())
         };
+
         // Narrowing a previously shared file also requires the old readers to release it.
         let require_lease = !open || (expected.mode | before.mode) & 0o077 != 0;
         let fd = match metadata_fd(&pinned) {
@@ -204,6 +213,7 @@ impl Tree {
             return Ok(Change::Busy);
         }
         verify_name(before.uid)?;
+
         let enrolling = before.marker_uid.is_none();
         if enrolling {
             let mut value = [1u8; 5];
@@ -227,6 +237,7 @@ impl Tree {
                 return Ok(Change::Busy);
             }
             fs::fchmod(&fd, restricted)?;
+
             verify_name(before.uid)?;
             if require_lease && !lease_is_exclusive(&fd)? {
                 return Ok(Change::Busy);
@@ -237,6 +248,7 @@ impl Tree {
                 Some(Gid::from_raw(wanted_gid)),
             )?;
         }
+
         verify_name(wanted_uid)?;
         if fd.metadata()?.mode() & 0o7777 != restricted.bits() {
             if require_lease && !lease_is_exclusive(&fd)? {
@@ -244,6 +256,7 @@ impl Tree {
             }
             fs::fchmod(&fd, restricted)?;
         }
+
         // Even an already-locked inode may be here because an earlier sync failed.
         fd.sync_all()
             .context("sync file ownership and permissions")?;
@@ -254,6 +267,7 @@ impl Tree {
         root.open_beneath(parent, DIR)?
             .sync_all()
             .context("sync the parent directory of the managed file")?;
+
         verify_name(wanted_uid)?;
         let after = FileAccess::inspect(&pinned)?;
         ensure!(
@@ -273,8 +287,10 @@ impl Tree {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs as disk;
+
+    use super::*;
+
     #[test]
     fn release_requires_protected_provenance_and_the_requested_identity() {
         let mut info = FileAccess {
@@ -290,10 +306,12 @@ mod tests {
         assert!(info.validate(1000).is_err());
         info.marker_uid = Some(2000);
         assert!(info.validate(1000).is_err());
+
         info.marker_uid = Some(1000);
         info.validate(1000).unwrap();
         assert!(info.is_locked(1000));
         assert!(!info.is_open(1000, 1000));
+
         info.uid = 1000;
         info.gid = 1000;
         info.acl_allows_public_read = false;
@@ -314,12 +332,15 @@ mod tests {
             Mode::empty(),
         )?);
         let fd = metadata_fd(&pinned)?;
+
         let reader = File::open(&path)?;
         assert!(!take_exclusive_lease(&fd)?);
         drop(reader);
+
         let writer = disk::OpenOptions::new().write(true).open(&path)?;
         assert!(!take_exclusive_lease(&fd)?);
         drop(writer);
+
         let reader = File::open(&path)?;
         // SAFETY: map one existing byte read-only. The mapping outlives reader and
         // is released below without constructing references into the mapped region.
@@ -340,6 +361,7 @@ mod tests {
         assert_eq!(unsafe { libc::munmap(mapping, 1) }, 0);
         assert!(!held);
         assert!(take_exclusive_lease(&fd)?);
+
         // Scanning metadata must not open another data descriptor or break our lease.
         assert!(FileAccess::inspect(&pinned)?.problem.is_none());
         assert!(lease_is_exclusive(&fd)?);
@@ -353,6 +375,7 @@ mod tests {
         disk::write(&path, b"fixture")?;
         let reader = File::open(&path)?;
         fs::fchmod(&reader, Mode::from_bits_retain(0o644))?;
+
         let uid = rustix::process::geteuid().as_raw();
         let gid = rustix::process::getegid().as_raw();
         let uid = if uid == 0 {
@@ -361,9 +384,11 @@ mod tests {
         } else {
             uid
         };
+
         let tree = Tree::new(&[root.path().into()], &[".env".into()], &[], uid)?;
         let before = tree.scan()?;
         let original = reader.metadata()?;
+
         assert_eq!(
             tree.set_access(&path, &before[&path], false, gid)?,
             Change::Busy
@@ -372,6 +397,7 @@ mod tests {
             tree.set_access(&path, &before[&path], true, gid)?,
             Change::Busy
         );
+
         assert_eq!(tree.scan()?, before);
         let current = reader.metadata()?;
         assert_eq!(
@@ -394,9 +420,11 @@ mod tests {
             if uid == 0 { 1000 } else { uid },
         )?;
         let files = t.scan()?;
+
         disk::rename(&path, root.path().join("old"))?;
         disk::write(&path, b"after")?;
         let original_mode = disk::metadata(&path)?.mode();
+
         assert!(t.set_access(&path, &files[&path], false, 1000).is_err());
         assert_eq!(disk::metadata(&path)?.mode(), original_mode);
         Ok(())

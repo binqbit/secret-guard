@@ -1,11 +1,5 @@
 //! Start and supervise a work command or terminal editor as the selected user.
-use super::User;
-use super::child::{child_setup, child_status, inherited_descriptors};
-use super::signals::{SessionSignals, pending_signal, remember_signal};
-use super::terminal::{Foreground, foreground_terminal, read_enter};
-use crate::output::{Palette, Tone};
-use anyhow::{Context, Result, ensure};
-use rustix::process::{self, Pid, Signal};
+
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -16,6 +10,15 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result, ensure};
+use rustix::process::{self, Pid, Signal};
+
+use super::User;
+use super::child::{child_setup, child_status, inherited_descriptors};
+use super::signals::{SessionSignals, pending_signal, remember_signal};
+use super::terminal::{Foreground, foreground_terminal, read_enter};
+use crate::output::{Palette, Tone};
+
 pub(crate) const COMMAND_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin";
 
 impl SessionSignals {
@@ -23,6 +26,7 @@ impl SessionSignals {
         if self.interrupted() {
             return Ok(128 + pending_signal());
         }
+
         if command.is_empty() {
             let mut tty =
                 foreground_terminal()?.context("a foreground controlling terminal is required")?;
@@ -32,6 +36,7 @@ impl SessionSignals {
                 "{}",
                 palette.paint(Tone::Action, "Press Enter to lock.")
             )?;
+
             let _ = read_enter(&mut tty)?;
             return Ok(if self.interrupted() {
                 128 + pending_signal()
@@ -39,6 +44,7 @@ impl SessionSignals {
                 0
             });
         }
+
         let tty = foreground_terminal()?;
         let mut child = Command::new(&command[0]);
         child.args(&command[1..]);
@@ -50,6 +56,7 @@ impl SessionSignals {
             !self.interrupted(),
             "edit interrupted before starting the editor"
         );
+
         let tty = foreground_terminal()?.context("editing requires a foreground terminal")?;
         let mut child = Command::new(editor);
         child
@@ -76,12 +83,14 @@ fn run_command(user: &User, mut cmd: Command, tty: Option<&File>) -> Result<i32>
             cmd.env(key, value);
         }
     }
+
     // Handle descriptors inherited from sudo as well as files opened by this process.
     // Rust marks the exec-error pipe it creates later close-on-exec itself.
     let inherited = inherited_descriptors()?
         .into_iter()
         .filter(|fd| *fd >= 3)
         .collect::<Vec<_>>();
+
     let tty_fd = tty.map(AsRawFd::as_raw_fd);
     let _foreground = tty.map(Foreground::capture).transpose()?;
     let supervisor = unsafe { libc::getpid() };
@@ -89,6 +98,7 @@ fn run_command(user: &User, mut cmd: Command, tty: Option<&File>) -> Result<i32>
     unsafe {
         cmd.pre_exec(move || child_setup(&target_user, tty_fd, &inherited, supervisor));
     }
+
     let child = cmd
         .spawn()
         .context("start working command as the session user")?;
@@ -97,6 +107,7 @@ fn run_command(user: &User, mut cmd: Command, tty: Option<&File>) -> Result<i32>
 
 fn signal_command(pid: Pid, signal: Signal) {
     let _ = process::kill_process_group(pid, signal);
+
     // A work command is free to change its own process group. It is still our
     // unreaped child, so its PID remains valid even if the original group is gone.
     if process::getpgid(Some(pid)).is_ok_and(|group| group != pid) {
@@ -107,6 +118,7 @@ fn signal_command(pid: Pid, signal: Signal) {
 fn wait_for_command(pid: Pid) -> Result<i32> {
     let mut terminating = None;
     let mut stopped = false;
+
     loop {
         if let Some(status) = child_status(pid).context("wait for working command")? {
             if let Some(signal) = status.stopping_signal() {
@@ -119,6 +131,7 @@ fn wait_for_command(pid: Pid) -> Result<i32> {
                 if let Some(signal) = status.terminating_signal() {
                     remember_signal(signal);
                 }
+
                 let signal = pending_signal();
                 return if signal == 0 {
                     status
@@ -129,6 +142,7 @@ fn wait_for_command(pid: Pid) -> Result<i32> {
                 };
             }
         }
+
         let signal = pending_signal();
         if terminating.is_none() && signal != 0 {
             let forward = if stopped || signal == libc::SIGTSTP {
@@ -141,6 +155,7 @@ fn wait_for_command(pid: Pid) -> Result<i32> {
         } else if terminating.is_some_and(|start| start.elapsed() >= Duration::from_secs(3)) {
             signal_command(pid, Signal::KILL);
         }
+
         std::thread::sleep(Duration::from_millis(40));
     }
 }

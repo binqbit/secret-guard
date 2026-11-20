@@ -1,7 +1,10 @@
 //! Install scoped signal handlers and record the first interruption.
-use super::checked;
-use anyhow::Result;
+
 use std::sync::atomic::{AtomicI32, Ordering};
+
+use anyhow::Result;
+
+use super::checked;
 
 pub(super) const SIGNALS: [i32; 5] = [
     libc::SIGINT,
@@ -32,6 +35,7 @@ impl SessionSignals {
             previous_mask: None,
         };
         SIGNAL.store(0, Ordering::Relaxed);
+
         for signal in SIGNALS.into_iter().chain([libc::SIGIO, libc::SIGCHLD]) {
             // A zeroed action has no flags. The handler only sets a lock-free atomic.
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -44,6 +48,7 @@ impl SessionSignals {
                 libc::SIGCHLD => libc::SIG_DFL,
                 _ => remember_signal as *const () as usize,
             };
+
             let mut old = action;
             unsafe {
                 libc::sigemptyset(&mut action.sa_mask);
@@ -51,6 +56,7 @@ impl SessionSignals {
             }
             guard.previous.push((signal, old));
         }
+
         // exec preserves the launcher's signal mask. Install all handlers
         // before unblocking a pending interrupt in this single-threaded CLI.
         unsafe {
@@ -78,6 +84,7 @@ impl Drop for SessionSignals {
                 libc::sigprocmask(libc::SIG_SETMASK, mask, std::ptr::null_mut());
             }
         }
+
         for (signal, action) in self.previous.iter().rev() {
             unsafe {
                 libc::sigaction(*signal, action, std::ptr::null_mut());

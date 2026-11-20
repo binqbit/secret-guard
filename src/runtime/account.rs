@@ -1,7 +1,9 @@
 //! Resolve the ordinary account and its supplementary groups.
+
+use std::{env, ffi::CString, path::PathBuf};
+
 use anyhow::{Context, Result, ensure};
 use nix::unistd::{Uid, User as Account, getgrouplist};
-use std::{env, ffi::CString, path::PathBuf};
 
 #[derive(Clone)]
 pub struct User {
@@ -18,10 +20,12 @@ fn account_user(account: Account) -> Result<User> {
         !account.uid.is_root(),
         "the session user must have a non-zero UID"
     );
+
     let groups = getgrouplist(&CString::new(account.name.as_bytes())?, account.gid)?
         .into_iter()
         .map(|gid| gid.as_raw())
         .collect();
+
     Ok(User {
         name: account.name,
         uid: account.uid.as_raw(),
@@ -47,6 +51,7 @@ pub fn resolve_user(selected: Option<&str>) -> Result<User> {
                 .context("invalid SUDO_UID")
         })
         .transpose()?;
+
     if let Some(name) = selected {
         let account = Account::from_name(name)?.context("selected user does not exist")?;
         ensure!(

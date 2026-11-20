@@ -1,4 +1,7 @@
 //! Resolve the working user and supervise an interactive session or user command.
+
+use std::io;
+
 mod account;
 mod child;
 mod command;
@@ -11,8 +14,6 @@ pub(crate) use command::COMMAND_PATH;
 pub(crate) use probe::check_file_access;
 pub(crate) use signals::SessionSignals;
 pub(crate) use terminal::{check_interactive, confirm_session_reset};
-
-use std::io;
 
 fn checked(result: libc::c_int) -> io::Result<()> {
     if result < 0 {

@@ -1,11 +1,13 @@
 //! Pin search roots and resolve their descendants within filesystem boundaries.
-use anyhow::{Context, Result, ensure};
-use rustix::fs::{self, Mode, OFlags, ResolveFlags};
+
 use std::{
     fs::File,
     os::{fd::AsRawFd, unix::fs::MetadataExt},
     path::{Component, Path, PathBuf},
 };
+
+use anyhow::{Context, Result, ensure};
+use rustix::fs::{self, Mode, OFlags, ResolveFlags};
 
 pub(super) const RESERVED_ROOTS: [&str; 2] = ["/etc/secret-guard", "/var/lib/secret-guard"];
 pub(super) const DIR: OFlags = OFlags::RDONLY
@@ -71,6 +73,7 @@ impl Root {
                     && !path.components().any(|part| part == Component::ParentDir),
                 "specify an absolute, non-filesystem-root directory without '..': {path:?}"
             );
+
             for reserved in RESERVED_ROOTS.map(Path::new) {
                 ensure!(
                     !path.starts_with(reserved) && !reserved.starts_with(path),
@@ -83,6 +86,7 @@ impl Root {
                     .any(|r| path.starts_with(&r.path) || r.path.starts_with(path)),
                 "overlapping roots: {path:?}"
             );
+
             roots.push(Self::open(path).with_context(|| format!("open configured root {path:?}"))?);
         }
         Ok(roots)

@@ -1,4 +1,5 @@
 //! Versioned session metadata and durable phase transitions.
+
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,7 @@ impl Session {
             scope: scope.clone(),
             roots: tree.root_ids()?,
         };
+
         store.save(&session)?;
         Ok(session)
     }
@@ -75,6 +77,7 @@ impl Session {
             "session belongs to UID {}; recover it as the original user",
             self.uid
         );
+
         ensure!(
             self.scope == *scope,
             "restore the original session user, roots and selection rules before recovery"
@@ -89,6 +92,7 @@ impl Session {
     pub(crate) fn phase(&mut self, store: &JournalStore, phase: Phase) -> Result<()> {
         self.phase = phase;
         self.pid = std::process::id();
+
         if let Err(error) = store.save(self) {
             // save may fail before rename or during the subsequent directory sync.
             // Consult the visible journal before deciding how to roll back.
@@ -109,12 +113,14 @@ impl Session {
         } else {
             Phase::Closing
         };
+
         if let Err(error) = self.phase(store, closing) {
             // A committed manual opening permits subsequent unlocks. Invalidate that
             // permission to reopen before beginning any partial closing transition.
             if was_manually_open {
                 return Err(error).context("record closing of manually unlocked files");
             }
+
             // All other journal phases already require recovery if the owner exits.
             return Ok(Some(error));
         }
@@ -124,8 +130,9 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn historical_v3_sessions_and_manual_recovery_keep_their_scope() -> Result<()> {
@@ -145,6 +152,7 @@ mod tests {
             "version": 3, "phase": "running", "user": "editor", "uid": uid, "pid": 123,
             "scope": &scope, "roots": tree.root_ids()?
         });
+
         for phase in ["opening", "running", "closing"] {
             let mut v3 = original.clone();
             v3["phase"] = json!(phase);
@@ -154,6 +162,7 @@ mod tests {
             assert!(session.manual_scope().is_none());
             assert!(!session.is_manual_open());
         }
+
         let mut session: Session = store.load()?.unwrap();
         for phase in [Phase::ManualOpening, Phase::Manual, Phase::ManualClosing] {
             session.phase(&store, phase)?;
@@ -162,6 +171,7 @@ mod tests {
             assert!(saved.manual_scope() == Some(&scope));
             assert_eq!(saved.is_manual_open(), matches!(phase, Phase::Manual));
         }
+
         session.phase(&store, Phase::Manual)?;
         assert!(session.begin_close(&store)?.is_none());
         let closing: Session = store.load()?.unwrap();
@@ -181,6 +191,7 @@ mod tests {
             .expect("report the failed phase write");
         assert!(warning.to_string().contains("exclusive state lock"));
         assert!(matches!(session.phase, Phase::ManualOpening));
+
         session.phase(&store, Phase::Manual)?;
         let error = session
             .begin_close(&reader)

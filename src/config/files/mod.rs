@@ -1,4 +1,5 @@
 //! Read and atomically edit rule lists beneath a verified installation directory.
+
 mod defaults;
 
 pub(crate) use defaults::initialize_if_needed;
@@ -43,6 +44,7 @@ impl ConfigFiles {
             acl_allows_public_read(&directory)?,
             "{CONFIG_DIR} has an access ACL entry without read permission"
         );
+
         Ok(Self {
             directory,
             uid,
@@ -88,6 +90,7 @@ impl ConfigFiles {
             Visibility::Public,
         )?
         .with_context(|| format!("missing required configuration file {CONFIG_DIR}/{name}"))?;
+
         let mut contents = String::new();
         file.read_to_string(&mut contents)
             .with_context(|| format!("read {CONFIG_DIR}/{name}"))?;
@@ -107,11 +110,13 @@ impl ConfigFiles {
 
     fn read_lists(&self, lists: &[RuleList]) -> Result<Vec<(RuleList, String)>> {
         self.check_ready()?;
+
         let mut held = Vec::with_capacity(lists.len());
         for &list in lists {
             let (file, contents) = self.capture(list)?;
             held.push((list, file, contents));
         }
+
         // Writers publish by rename. Verify all names after pinning the whole set,
         // so a completed reset between two opens cannot produce a mixed scope.
         // Readers need no flock on this publicly accessible directory.
@@ -125,6 +130,7 @@ impl ConfigFiles {
             );
             contents.push((list, text));
         }
+
         self.check_ready()?;
         Ok(contents)
     }
@@ -142,6 +148,7 @@ impl ConfigFiles {
             return Ok(());
         }
         list.validate_edit(edited)?;
+
         let dir_path = descriptor_path(&self.directory);
         let name = list.filename();
         let mut pending =
@@ -163,6 +170,7 @@ impl ConfigFiles {
             self.read(list)? == original,
             "{CONFIG_DIR}/{name} changed while editing; reopen it to apply your changes"
         );
+
         fs::fchmod(&pending, Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH)
             .context("set rule file permissions")?;
         ensure!(
@@ -200,9 +208,10 @@ fn editable_config(dir: &Path) -> Result<ConfigFiles> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs as disk;
     use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
 
     #[test]
     fn configuration_uses_three_editable_lists() -> Result<()> {
@@ -219,6 +228,7 @@ mod tests {
             disk::set_permissions(path, disk::Permissions::from_mode(0o644))?;
             Ok(())
         };
+
         write(
             ".indexingfolders",
             "# Projects\n/srv/first project\n/srv/second\n",
@@ -233,6 +243,7 @@ mod tests {
         );
         assert_eq!(scope.patterns, [".env", ".secrets/"]);
         assert!(scope.ignores.is_empty());
+
         for mode in [0o700, 0o750, 0o775, 0o777] {
             disk::set_permissions(tmp.path(), disk::Permissions::from_mode(mode))?;
             assert!(read_lists().is_err());
@@ -261,15 +272,18 @@ mod tests {
         disk::set_permissions(&path, disk::Permissions::from_mode(0o644))?;
         let mut old = File::open(&path)?;
         let old_meta = old.metadata()?;
+
         // Reading and repairing the selected list does not depend on the other two.
         assert_eq!(config.read(list)?, original);
         assert!(config.scope(None).is_err());
+
         let writer = File::open(tmp.path())?;
         fs::flock(&writer, FlockOperation::NonBlockingLockExclusive)?;
         assert!(config.replace(list, original, edited).is_err());
         assert_eq!(config.read(list)?, original);
         assert_eq!(disk::read_dir(tmp.path())?.count(), 1);
         drop(writer);
+
         config.replace(list, original, edited)?;
         assert_eq!(config.read(list)?, edited);
         let current = disk::metadata(&path)?;
@@ -282,6 +296,7 @@ mod tests {
         let mut old_contents = String::new();
         old.read_to_string(&mut old_contents)?;
         assert_eq!(old_contents, original);
+
         config.replace(list, edited, edited)?;
         assert_eq!(disk::metadata(&path)?.ino(), current.ino());
         assert!(config.replace(list, original, ".env\n").is_err());
@@ -308,6 +323,7 @@ mod tests {
             assert!(config.replace(list, before, rejected).is_err());
             assert_eq!(config.read(list)?, before);
         }
+
         config.replace(RuleList::Ignore, "target/", "")?;
         assert_eq!(config.read(RuleList::Ignore)?, "");
         Ok(())

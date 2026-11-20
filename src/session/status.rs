@@ -1,4 +1,5 @@
 //! Snapshot session state and report the files in the requested scope.
+
 use std::io::Write;
 
 use anyhow::Result;
@@ -28,16 +29,20 @@ pub(crate) fn status(
         let target = Target::resolve(registry, &entries, selection, caller.uid, false)?;
         (entries, target)
     };
+
     let entry = entries.iter().find(|entry| entry.slot == target.slot);
     let session = entry.and_then(|entry| entry.session.as_ref());
     if !paths {
         describe_status(&target, &entries, entry)?;
     }
+
     let owner = match session.map(|session| session.uid).or(target.binding_uid) {
         Some(uid) if uid != caller.uid => Some(runtime::resolve_uid(uid)?),
         _ => None,
     };
     let user = owner.as_ref().unwrap_or(caller);
+
+    // Full status describes the open session. --paths previews the installed rules.
     let saved = session.filter(|_| !paths);
     let (_, tree) = target.tree(caller, user.uid, saved.map(Session::scope), saved)?;
     display::show_files(tree.scan()?, user, paths)?;
@@ -47,12 +52,14 @@ pub(crate) fn status(
 fn describe_status(target: &Target, entries: &[Entry], selected: Option<&Entry>) -> Result<()> {
     let mut out = std::io::stdout().lock();
     let palette = Palette::for_stream(&out);
+
     if target.slot == Slot::Default {
         let mut peers = entries
             .iter()
             .filter(|entry| entry.slot != Slot::Default)
             .peekable();
         let show_default = peers.peek().is_some() || palette.is_terminal();
+
         for peer in peers {
             display::session_heading(&mut out, &peer.slot, peer.root(), &palette)?;
             display::describe(
@@ -66,12 +73,14 @@ fn describe_status(target: &Target, entries: &[Entry], selected: Option<&Entry>)
                 writeln!(out)?;
             }
         }
+
         if show_default {
             display::session_heading(&mut out, &target.slot, None, &palette)?;
         }
     } else {
         display::session_heading(&mut out, &target.slot, target.root.as_deref(), &palette)?;
     }
+
     display::describe(
         &mut out,
         selected.and_then(|e| e.session.as_ref()),

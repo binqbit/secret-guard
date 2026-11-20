@@ -1,4 +1,5 @@
 //! Publish packaged defaults on first use and durably replace them on reset.
+
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -23,6 +24,7 @@ fn uninitialized_at(parent: &File, uid: u32, gid: u32) -> Result<bool> {
         Err(Errno::NOENT) => return Ok(true),
         Err(e) => return Err(e).context(CONFIG_DIR),
     };
+
     check_directory_search(&directory, Path::new(CONFIG_DIR))?;
     let files = ConfigFiles::from_directory(directory, uid, gid)?;
     for entry in Dir::read_from(&files.directory)? {
@@ -59,6 +61,7 @@ fn stage_defaults(
     let (staged, directory) = stage_directory(parent, ".secret-guard-init-", uid, gid)?;
     let owner = Some(Uid::from_raw(uid));
     let group = Some(Gid::from_raw(gid));
+
     // Published rules use public read access even when /etc has a restrictive default ACL.
     // Change only our new objects. Remove the inherited default before creating any files.
     for acl in ["system.posix_acl_access", "system.posix_acl_default"] {
@@ -69,6 +72,7 @@ fn stage_defaults(
             }
         }
     }
+
     for list in RuleList::ALL {
         let mut file = File::from(fs::openat(
             &directory,
@@ -88,9 +92,11 @@ fn initialize_at(parent: &File, home: &Path, uid: u32, gid: u32) -> Result<()> {
     if !uninitialized_at(parent, uid, gid)? {
         return Ok(());
     }
+
     let (staged, directory) = stage_defaults(parent, home, uid, gid)?;
     fs::fchmod(&directory, Mode::from_bits_retain(0o755))?;
     directory.sync_all()?;
+
     // Linux rename installs a complete directory at an absent or empty destination.
     // A competing publisher or administrator who populated it first keeps their files.
     let name = staged
@@ -129,6 +135,7 @@ impl ConfigFiles {
         }
 
         let (_stage, staged_dir) = stage_defaults(&self.directory, home, self.uid, self.gid)?;
+
         if self.reset_pending()? {
             let marker = checked_file(
                 &self.directory,
@@ -159,6 +166,7 @@ impl ConfigFiles {
             marker.as_file().sync_all()?;
             marker.persist_noclobber(path.join(RESET_PENDING))?;
         }
+
         // Make interruption visible before the first rename. Readers refuse a
         // marked snapshot until all three defaults are durable.
         self.directory.sync_all()?;
@@ -171,6 +179,7 @@ impl ConfigFiles {
             )?;
         }
         self.directory.sync_all()?;
+
         fs::unlinkat(&self.directory, RESET_PENDING, AtFlags::empty())?;
         self.directory.sync_all()?;
         Ok(())
@@ -179,11 +188,13 @@ impl ConfigFiles {
 
 #[cfg(test)]
 mod tests {
-    use super::super::editable_config;
-    use super::*;
-    use rustix::fs::FlockOperation;
     use std::fs as disk;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    use rustix::fs::FlockOperation;
+
+    use super::super::editable_config;
+    use super::*;
 
     #[test]
     fn competing_first_runs_publish_one_complete_default_configuration() -> Result<()> {
@@ -192,6 +203,7 @@ mod tests {
         let meta = parent.metadata()?;
         let (uid, gid) = (meta.uid(), meta.gid());
         let barrier = std::sync::Barrier::new(2);
+
         std::thread::scope(|s| -> Result<()> {
             let first = s.spawn(|| {
                 barrier.wait();
@@ -202,6 +214,7 @@ mod tests {
             first.join().unwrap()?;
             second
         })?;
+
         let config =
             ConfigFiles::from_directory(File::open(tmp.path().join("secret-guard"))?, uid, gid)?;
         let folders = config.read(RuleList::Folders)?;
@@ -212,6 +225,7 @@ mod tests {
         for list in [RuleList::Secrets, RuleList::Ignore] {
             assert_eq!(config.read(list)?, list.defaults(Path::new("/"))?);
         }
+
         let rules = tmp.path().join("secret-guard/.indexingignore");
         disk::write(rules, "local-only/\n")?;
         initialize_at(&parent, Path::new("/"), uid, gid)?;
@@ -235,10 +249,12 @@ mod tests {
         assert!(initialize_at(&parent, Path::new("/srv/alice"), uid, gid).is_err());
         assert_eq!(disk::read_dir(outside.path())?.count(), 0);
         disk::remove_file(&path)?;
+
         disk::create_dir(&path)?;
         disk::set_permissions(&path, disk::Permissions::from_mode(0o777))?;
         assert!(initialize_at(&parent, Path::new("/srv/alice"), uid, gid).is_err());
         disk::set_permissions(&path, disk::Permissions::from_mode(0o755))?;
+
         for file in ["config.toml", ".indexingsecrets"] {
             let existing = path.join(file);
             disk::write(&existing, "original")?;
@@ -247,6 +263,7 @@ mod tests {
             assert_eq!(disk::read_dir(&path)?.count(), 1);
             disk::remove_file(&existing)?;
         }
+
         initialize_at(&parent, Path::new("/srv/alice"), uid, gid)?;
         assert_eq!(disk::read_dir(&path)?.count(), 3);
         Ok(())
@@ -264,6 +281,7 @@ mod tests {
         disk::set_permissions(&secrets, disk::Permissions::from_mode(0o600))?;
         let extra = tmp.path().join("site-settings");
         disk::write(&extra, "keep")?;
+
         let marker = tmp.path().join(RESET_PENDING);
         disk::write(&marker, RESET_SIGNATURE)?;
         disk::set_permissions(&marker, disk::Permissions::from_mode(0o600))?;
@@ -285,6 +303,7 @@ mod tests {
                 0o644
             );
         }
+
         // An ordinary reader can flock the directory. It cannot obstruct scanning
         // or session recovery, which both rely on the aggregate snapshot.
         let reader = File::open(tmp.path())?;
@@ -306,6 +325,7 @@ mod tests {
         disk::write(&first, "/custom")?;
         let extra = tmp.path().join("keep");
         disk::write(&extra, "original")?;
+
         let ignore = tmp.path().join(RuleList::Ignore.filename());
         symlink(&extra, &ignore)?;
         assert!(config.reset(home).is_err());
@@ -314,6 +334,7 @@ mod tests {
         disk::hard_link(&extra, &ignore)?;
         assert!(config.reset(home).is_err());
         disk::remove_file(&ignore)?;
+
         let marker = tmp.path().join(RESET_PENDING);
         disk::write(&marker, "unrelated")?;
         disk::set_permissions(&marker, disk::Permissions::from_mode(0o600))?;

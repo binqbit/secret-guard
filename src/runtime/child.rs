@@ -1,9 +1,12 @@
 //! Shared process setup and wait primitives for commands and access probes.
-use super::{User, checked, signals::SIGNALS, terminal::set_foreground};
-use anyhow::{Context, Result};
-use rustix::process::{self, Pid, WaitOptions, WaitStatus};
+
 use std::io;
 use std::os::fd::RawFd;
+
+use anyhow::{Context, Result};
+use rustix::process::{self, Pid, WaitOptions, WaitStatus};
+
+use super::{User, checked, signals::SIGNALS, terminal::set_foreground};
 
 // Prepare only async-signal-safe operations for the fork-to-exec interval.
 pub(super) fn child_setup(
@@ -17,6 +20,7 @@ pub(super) fn child_setup(
         if let Some(fd) = tty {
             set_foreground(fd, libc::getpgrp())?;
         }
+
         for signal in
             SIGNALS
                 .into_iter()
@@ -33,23 +37,28 @@ pub(super) fn child_setup(
             &empty,
             std::ptr::null_mut(),
         ))?;
+
         for &fd in inherited {
             let rc = libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             if rc == -1 && io::Error::last_os_error().raw_os_error() != Some(libc::EBADF) {
                 return Err(io::Error::last_os_error());
             }
         }
+
         checked(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))?;
         checked(libc::setgroups(user.groups.len(), user.groups.as_ptr()))?;
         checked(libc::setresgid(user.gid, user.gid, user.gid))?;
         checked(libc::setresuid(user.uid, user.uid, user.uid))?;
         checked(libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0))?;
+
         // Clear even inherited capabilities kept across a UID change by securebits.
         // Linux capability ABI version 3: header {version,pid}, then two
         // {effective,permitted,inheritable} words sets.
         let header = [0x2008_0522u32, 0];
         let sets = [0u32; 6];
         checked(libc::syscall(libc::SYS_capset, header.as_ptr(), sets.as_ptr()) as i32)?;
+
+        // Check the parent after arming the signal in case it exited during setup.
         checked(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0))?;
         if libc::getppid() != supervisor {
             return Err(io::Error::from_raw_os_error(libc::ECHILD));

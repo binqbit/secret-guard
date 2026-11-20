@@ -1,4 +1,5 @@
 //! Compile path globs and explicit file or directory exclusions.
+
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -21,6 +22,7 @@ impl Rule {
                     .any(|s| s.is_empty() || s == "." || s == ".."),
             "invalid relative pattern {pattern:?}"
         );
+
         let matcher = GlobBuilder::new(glob)
             .literal_separator(true)
             .build()
@@ -63,6 +65,7 @@ pub(crate) enum IgnoreRule {
 impl IgnoreRule {
     pub(crate) fn compile(entry: &str) -> Result<Self> {
         ensure!(!entry.contains('\0'), "invalid ignore entry {entry:?}");
+
         let path = Path::new(entry);
         if path.is_absolute() || entry.starts_with("./") {
             ensure!(
@@ -77,6 +80,7 @@ impl IgnoreRule {
                 directory_only: entry.ends_with('/'),
             });
         }
+
         Ok(Self::Pattern(Rule::compile(entry)?))
     }
 

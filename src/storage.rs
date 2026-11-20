@@ -1,4 +1,5 @@
 //! Open trusted configuration and journal objects through verified directory descriptors.
+
 use std::fs::File;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path};
@@ -25,6 +26,7 @@ pub(crate) fn stage_directory(
         .prefix(prefix)
         .permissions(mode.clone())
         .tempdir_in(descriptor_path(parent))?;
+
     // Restore owner access after mkdir's umask, then clear any inherited setgid group.
     std::fs::set_permissions(stage.path(), mode)?;
     let directory = File::open(stage.path())?;
@@ -50,6 +52,7 @@ pub(crate) fn trusted_path(path: &Path, visibility: Visibility) -> Result<File> 
     ensure!(path.is_absolute(), "expected absolute trusted directory");
     let lookup = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut directory = File::from(fs::open("/", lookup, Mode::empty())?);
+
     for component in path.components() {
         if let Component::Normal(name) = component {
             directory = fs::openat(&directory, name, lookup, Mode::empty())
@@ -61,6 +64,7 @@ pub(crate) fn trusted_path(path: &Path, visibility: Visibility) -> Result<File> 
                 "expected absolute trusted directory"
             );
         }
+
         let meta = directory.metadata()?;
         ensure!(
             meta.uid() == 0 && meta.mode() & 0o022 == 0,
@@ -92,6 +96,7 @@ pub(crate) fn checked_file(
             && !name.as_bytes().contains(&0),
         "expected a single plain filename"
     );
+
     // Pin and verify the object's type before acquiring a data descriptor.
     let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let file = match fs::openat(directory, name, flags, Mode::empty()) {
@@ -99,6 +104,7 @@ pub(crate) fn checked_file(
         Err(Errno::NOENT) => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("open {name:?}")),
     };
+
     let meta = file.metadata()?;
     let mode = match visibility {
         Visibility::Public => 0o644,
@@ -119,14 +125,16 @@ pub(crate) fn checked_file(
             "{name:?} has an access ACL entry without read permission"
         );
     }
+
     Ok(Some(File::open(descriptor_path(&file))?))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs as disk;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use super::*;
 
     #[test]
     fn rule_files_must_be_public_readable_regular_siblings() -> Result<()> {
@@ -134,6 +142,7 @@ mod tests {
         let parent = File::open(tmp.path())?;
         let uid = rustix::process::geteuid().as_raw();
         let gid = rustix::process::getegid().as_raw();
+
         for name in [
             "",
             ".",
@@ -149,18 +158,22 @@ mod tests {
                 "{name:?}"
             );
         }
+
         let rules = tmp.path().join(".indexingsecrets");
         disk::write(&rules, b".env\n")?;
         disk::set_permissions(&rules, disk::Permissions::from_mode(0o644))?;
         assert!(checked_file(&parent, ".indexingsecrets", uid, gid, Visibility::Public)?.is_some());
+
         symlink(&rules, tmp.path().join(".indexingignore"))?;
         assert!(checked_file(&parent, ".indexingignore", uid, gid, Visibility::Public).is_err());
+
         for mode in [0o600, 0o640, 0o664, 0o646, 0o666] {
             disk::set_permissions(&rules, disk::Permissions::from_mode(mode))?;
             assert!(
                 checked_file(&parent, ".indexingsecrets", uid, gid, Visibility::Public).is_err()
             );
         }
+
         disk::set_permissions(&rules, disk::Permissions::from_mode(0o644))?;
         disk::hard_link(&rules, tmp.path().join("another-link"))?;
         assert!(checked_file(&parent, ".indexingsecrets", uid, gid, Visibility::Public).is_err());

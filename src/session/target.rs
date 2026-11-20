@@ -1,4 +1,5 @@
 //! Resolve a selected slot to its binding, verified tree and journal.
+
 use std::{fs::File, path::PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -31,6 +32,7 @@ impl Target {
     ) -> Result<Self> {
         let (slot, supplied) = selection.resolve(entries)?;
         let store = slot.open(registry, false)?;
+
         let (root, binding_uid) = if let Slot::Named(name) = &slot {
             let binding = store
                 .as_ref()
@@ -45,6 +47,7 @@ impl Target {
         } else {
             (supplied, None)
         };
+
         Ok(Self {
             slot,
             root,
@@ -71,6 +74,7 @@ impl Target {
                 config::read_config(self.root.as_deref())?
             }
         };
+
         let tree = Tree::new(&scope.roots, &scope.patterns, &scope.ignores, owner_uid)?;
         if let Slot::Direct(id) = self.slot {
             ensure!(
@@ -78,12 +82,14 @@ impl Target {
                 "restore the original directory for this session"
             );
         }
+
         if let Some(session) = session {
             session.validate(&tree, owner_uid, &scope)?;
             overlap::check_protected_roots(&tree)?;
         } else {
             overlap::check_selection(&tree)?;
         }
+
         Ok((scope, tree))
     }
 
@@ -95,6 +101,7 @@ impl Target {
             );
             return Ok(None);
         };
+
         ensure!(
             store.try_exclusive()?,
             "session {} is already active; inspect it with status",
@@ -103,6 +110,7 @@ impl Target {
         if let Some(snapshot) = approved {
             store.verify_session(snapshot)?;
         }
+
         store.load()
     }
 
@@ -118,6 +126,7 @@ impl Target {
                 store
             }
         };
+
         if matches!(self.slot, Slot::Named(_)) && self.binding_uid.is_none() {
             let path = self
                 .root

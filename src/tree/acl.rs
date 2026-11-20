@@ -1,4 +1,5 @@
 //! Validate Linux access ACLs for public configuration and file status.
+
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
@@ -24,6 +25,7 @@ fn access_acl(fd: &File) -> Result<Option<AclPermissions>> {
         Err(Errno::NODATA | Errno::OPNOTSUPP) => return Ok(None),
         Err(e) => return Err(e).context("inspect access ACL"),
     };
+
     let mut bytes = vec![0; size];
     let used = fs::getxattr(&proc_path, ACL, &mut bytes[..]).context("read access ACL")?;
     parse_acl(&bytes[..used]).map(Some)
@@ -61,6 +63,7 @@ fn parse_acl(bytes: &[u8]) -> Result<AclPermissions> {
         .context("invalid access ACL version")?;
     let (entries, remainder) = entries.as_chunks::<8>();
     ensure!(remainder.is_empty(), "truncated access ACL");
+
     let mut kinds = 0;
     let mut previous_tag = 0;
     let mut named = BTreeSet::new();
@@ -72,6 +75,7 @@ fn parse_acl(bytes: &[u8]) -> Result<AclPermissions> {
         let id = u32::from_le_bytes(entry[4..].try_into().unwrap());
         ensure!(tag >= previous_tag && perm <= 7, "invalid access ACL entry");
         previous_tag = tag;
+
         match tag {
             USER | GROUP => ensure!(
                 id != u32::MAX && named.insert((tag, id)),
@@ -82,17 +86,20 @@ fn parse_acl(bytes: &[u8]) -> Result<AclPermissions> {
             }
             _ => anyhow::bail!("unknown access ACL entry"),
         }
+
         kinds |= tag;
         all_can_search &= perm & 1 != 0;
         if matches!(tag, USER | GROUP | OWNING_GROUP) {
             group_class_can_read &= perm & 4 != 0;
         }
     }
+
     let base = OWNER | OWNING_GROUP | OTHER;
     ensure!(
         kinds & base == base && (named.is_empty() || kinds & MASK != 0),
         "incomplete access ACL"
     );
+
     // With a mask, named entries and the owning group's underlying permission
     // bits survive chmod. They must independently allow read under the new mask.
     Ok(AclPermissions {
@@ -103,17 +110,21 @@ fn parse_acl(bytes: &[u8]) -> Result<AclPermissions> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::FileAccess;
-    use super::*;
-    use rustix::fs::{Mode, XattrFlags};
     use std::fs as disk;
     use std::os::unix::fs::PermissionsExt;
+
+    use rustix::fs::{Mode, XattrFlags};
+
+    use super::super::FileAccess;
+    use super::*;
+
     #[test]
     fn public_configuration_requires_searchable_directories() -> Result<()> {
         let root = tempfile::tempdir()?;
         let private = root.path().join("private");
         disk::create_dir(&private)?;
         disk::set_permissions(&private, disk::Permissions::from_mode(0o700))?;
+
         let error = check_directory_search(&File::open(&private)?, &private).unwrap_err();
         assert!(error.to_string().contains("private"));
         assert_eq!(disk::metadata(private)?.mode() & 0o777, 0o700);
@@ -148,13 +159,16 @@ mod tests {
         let info = FileAccess::inspect(&fd)?;
         assert!(info.is_public(info.uid, info.gid));
         assert!(!info.is_open(info.uid, info.gid));
+
         entries[1].1 = 0;
         fs::fsetxattr(&fd, ACL, &fixture_acl(&entries), XattrFlags::empty())?;
         assert!(!FileAccess::inspect(&fd)?.is_public(info.uid, info.gid));
+
         fs::fchmod(&fd, Mode::RUSR | Mode::WUSR)?;
         let private = FileAccess::inspect(&fd)?;
         assert!(private.is_open(info.uid, info.gid));
         assert!(!private.is_public(info.uid, info.gid));
+
         // chmod preserved named read grants and denials, and masked every grant.
         entries[4].1 = 0;
         entries[5].1 = 0;
@@ -178,9 +192,11 @@ mod tests {
         ];
         fs::fsetxattr(&fd, ACL, &fixture_acl(&entries), XattrFlags::empty())?;
         assert!(access_acl(&fd)?.unwrap().all_can_search);
+
         entries[1].1 = 4;
         fs::fsetxattr(&fd, ACL, &fixture_acl(&entries), XattrFlags::empty())?;
         assert!(!access_acl(&fd)?.unwrap().all_can_search);
+
         entries[1].1 = 1;
         entries[3].1 = 4;
         fs::fsetxattr(&fd, ACL, &fixture_acl(&entries), XattrFlags::empty())?;
@@ -193,8 +209,10 @@ mod tests {
         let base = u32::MAX;
         assert!(parse_acl(&[]).is_err());
         assert!(parse_acl(&[2, 0, 0, 0, 1]).is_err());
+
         let missing_mask = [(1, 7, base), (2, 4, 55), (4, 7, base), (32, 5, base)];
         assert!(parse_acl(&fixture_acl(&missing_mask)).is_err());
+
         let duplicate = [
             (1, 7, base),
             (2, 4, 55),

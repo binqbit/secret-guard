@@ -1,4 +1,5 @@
 //! Apply the configured file permissions and verify each complete pass.
+
 use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -16,6 +17,7 @@ pub(super) fn preflight(tree: &Tree, user: &User) -> Result<BTreeMap<PathBuf, Fi
             .validate(user.uid)
             .with_context(|| format!("cannot open {path:?}"))?;
     }
+
     runtime::check_file_access(user, &files, Access::EXISTS)?;
     Ok(files)
 }
@@ -36,6 +38,7 @@ pub(super) fn open_files(
             "file is in use and could not be opened: {path:?}"
         );
     }
+
     let current = tree.scan()?;
     for (path, access) in &current {
         ensure!(
@@ -43,6 +46,7 @@ pub(super) fn open_files(
             "file appeared or changed during session opening: {path:?}"
         );
     }
+
     runtime::check_file_access(user, &current, Access::READ_OK | Access::WRITE_OK)
 }
 
@@ -59,6 +63,7 @@ pub(super) fn close(
         if pending.is_empty() {
             return Ok(());
         }
+
         signals.wait_for_retry(&pending)?;
     }
 }
@@ -75,6 +80,7 @@ fn close_pass(tree: &Tree, user: &User) -> Result<Vec<PathBuf>> {
             Err(e) => failures.push(format!("{path:?}: {e:#}")),
         }
     }
+
     if !failures.is_empty() {
         failures.extend(busy.iter().map(|path| format!("{path:?}: still in use")));
         bail!("could not lock all files:\n{}", failures.join("\n"));

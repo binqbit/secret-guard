@@ -1,4 +1,5 @@
 //! Human-readable terminal output and the plain formats used by scripts.
+
 use std::fmt::Display;
 use std::io::{self, IsTerminal, Write};
 
@@ -42,6 +43,7 @@ impl Palette {
         if !self.color {
             return text;
         }
+
         match tone {
             Tone::Open => text.green(),
             Tone::Locked => text.red(),
@@ -69,6 +71,7 @@ pub fn print_cli_message(error: &clap::Error) {
             write!(out, "{rendered}")
         }
     }
+
     // Match clap's exit behavior when a reader closes a help or error pipe.
     if error.use_stderr() {
         let _ = print(&mut io::stderr().lock(), error);
@@ -103,6 +106,7 @@ fn write_error(out: &mut (impl Write + IsTerminal), error: &anyhow::Error) -> io
             palette.paint(Tone::Error, "Error"),
             terminal_text(&error.to_string())
         )?;
+
         for cause in error.chain().skip(1) {
             writeln!(out, "       {}", terminal_text(&cause.to_string()))?;
         }

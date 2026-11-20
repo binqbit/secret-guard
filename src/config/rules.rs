@@ -1,4 +1,5 @@
 //! Names, syntax and packaged contents of the three rule lists.
+
 use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
 
@@ -23,6 +24,7 @@ impl Scope {
             patterns: Vec::new(),
             ignores: Vec::new(),
         };
+
         for (list, raw) in lists {
             let entries = list.entries(&raw)?;
             match list {
@@ -86,6 +88,7 @@ impl RuleList {
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .map(str::to_owned)
             .collect();
+
         let required = match self {
             Self::Folders => Some("absolute search directory"),
             Self::Secrets => Some("file or directory pattern"),
@@ -160,6 +163,7 @@ mod tests {
             render_folders(template, Path::new("/srv/Local User/"))?,
             expected
         );
+
         for invalid in [
             "/",
             "relative",

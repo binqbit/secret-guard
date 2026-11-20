@@ -1,4 +1,5 @@
 //! Edit rule lists in a private draft owned by the ordinary user.
+
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -19,6 +20,7 @@ fn select_editor(preferred: Option<&str>) -> Result<OsString> {
         ensure!(!editor.is_empty(), "specify an editor executable");
         return Ok(editor.into());
     }
+
     for name in ["vim", "nano", "vi"] {
         for dir in env::split_paths(OsStr::new(runtime::COMMAND_PATH)) {
             let path = dir.join(name);
@@ -48,6 +50,7 @@ fn read_draft(directory: &File, name: &str, uid: u32) -> Result<String> {
         meta.is_file() && meta.uid() == uid && meta.nlink() == 1,
         "the edited draft must be a regular file owned by the editor user with a single link"
     );
+
     let mut contents = String::new();
     File::open(crate::tree::descriptor_path(&pinned))?
         .read_to_string(&mut contents)
@@ -70,6 +73,7 @@ fn remove_drafts(outer: &TempDir, directory: &File) -> Result<()> {
             result => result?,
         }
     }
+
     fs::remove_dir(outer.path().join("draft"))?;
     fs::remove_dir(outer.path())?;
     Ok(())
@@ -86,11 +90,13 @@ pub(super) fn edit_text(
         "expected a single rule filename"
     );
     let editor = select_editor(preferred_editor)?;
+
     let temp = fs::symlink_metadata("/tmp")?;
     ensure!(
         temp.is_dir() && temp.uid() == 0 && (temp.mode() & 0o022 == 0 || temp.mode() & 0o1000 != 0),
         "/tmp must be a root-owned directory with protected root entries"
     );
+
     let mut outer = tempfile::Builder::new()
         .prefix("secret-guard-edit-")
         .permissions(Permissions::from_mode(0o700))
@@ -99,6 +105,7 @@ pub(super) fn edit_text(
     fs::create_dir(&draft_dir)?;
     let directory = File::open(&draft_dir)?;
     let path = draft_dir.join(list_name);
+
     let uid = Some(Uid::from_raw(user.uid));
     let gid = Some(Gid::from_raw(user.gid));
     {
@@ -112,12 +119,14 @@ pub(super) fn edit_text(
         linux::fchmod(&draft, Mode::RUSR | Mode::WUSR)?;
     }
     linux::fchmod(&directory, Mode::RWXU)?;
+
     // The outer directory remains root-owned under sticky /tmp. After handoff
     // the editor can save atomically inside draft, but cannot replace draft itself.
     outer.disable_cleanup(true);
     let result = (|| -> Result<Option<String>> {
         linux::fchown(&directory, uid, gid)?;
         fs::set_permissions(outer.path(), Permissions::from_mode(0o711))?;
+
         let signals = SessionSignals::install()?;
         let code = signals
             .run_editor(user, &editor, &path)
@@ -126,10 +135,12 @@ pub(super) fn edit_text(
             code == 0,
             "editor {editor:?} exited with status {code}; rules were not saved"
         );
+
         let edited = read_draft(&directory, list_name, user.uid)?;
         ensure!(!signals.interrupted(), "edit interrupted before saving");
         Ok((edited != contents).then_some(edited))
     })();
+
     if let Err(error) = remove_drafts(&outer, &directory) {
         let palette = Palette::for_stream(&std::io::stderr());
         let _ = writeln!(
@@ -144,8 +155,9 @@ pub(super) fn edit_text(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::os::unix::fs::symlink;
+
+    use super::*;
 
     #[test]
     fn accepts_editor_rename_and_rejects_substituted_drafts() -> Result<()> {
@@ -155,15 +167,18 @@ mod tests {
         let name = ".indexingfolders";
         let path = tmp.path().join(name);
         let saved = tmp.path().join("saved");
+
         fs::write(&path, "/old\n")?;
         fs::write(&saved, "/new\n")?;
         fs::rename(&saved, &path)?;
         assert_eq!(read_draft(&directory, name, uid)?, "/new\n");
+
         fs::hard_link(&path, &saved)?;
         assert!(read_draft(&directory, name, uid).is_err());
         fs::remove_file(&path)?;
         symlink(&saved, &path)?;
         assert!(read_draft(&directory, name, uid).is_err());
+
         fs::remove_file(&path)?;
         linux::mkfifoat(&directory, name, Mode::RUSR | Mode::WUSR)?;
         assert!(read_draft(&directory, name, uid).is_err());

@@ -1,4 +1,5 @@
 //! Dispatch configuration commands and present installed rule lists.
+
 use std::env;
 use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
@@ -34,10 +35,12 @@ fn show() -> Result<()> {
     let lists = ConfigFiles::open()?.read_all()?;
     let mut out = io::stdout().lock();
     let palette = Palette::for_stream(&out);
+
     for (index, (list, contents)) in lists.into_iter().enumerate() {
         if index > 0 {
             writeln!(out)?;
         }
+
         if palette.is_terminal() {
             let heading = match list {
                 RuleList::Folders => "Search folders",
@@ -59,6 +62,7 @@ fn show() -> Result<()> {
             writeln!(out, "[{}]", list.name())?;
             out.write_all(contents.as_bytes())?;
         }
+
         if !contents.is_empty() && !contents.ends_with('\n') {
             writeln!(out)?;
         }
@@ -73,6 +77,7 @@ fn run_with_sudo(selected_user: Option<&str>, args: &[&str]) -> Result<i32> {
     if let Some(user) = selected_user {
         sudo.args(["--user", user]);
     }
+
     Err(sudo.arg("config").args(args).exec()).context("start sudo for Secret Guard configuration")
 }
 
@@ -80,6 +85,7 @@ fn reset(selected_user: Option<&str>) -> Result<i32> {
     if !rustix::process::geteuid().is_root() {
         return run_with_sudo(selected_user, &["reset"]);
     }
+
     let user = runtime::resolve_user(selected_user)?;
     let store = JournalStore::open()?;
     let admission = store.admission()?;
@@ -89,6 +95,7 @@ fn reset(selected_user: Option<&str>) -> Result<i32> {
             entry.idle,
             "session {label} is active; finish it before resetting the configuration"
         );
+
         let session = entry.session.as_ref().context("missing session state")?;
         let state = if session.is_manual_open() {
             "files are manually unlocked"
@@ -98,8 +105,11 @@ fn reset(selected_user: Option<&str>) -> Result<i32> {
         let hint = entry.slot.close_hint(entry.root());
         bail!("session {label}: {state}. {hint}");
     }
+
     files::reset_config(&user.home)?;
+    // Let other sessions proceed while the terminal prints the result.
     drop(admission);
+
     let mut out = io::stdout().lock();
     let palette = Palette::for_stream(&out);
     writeln!(
@@ -121,11 +131,13 @@ pub(crate) fn run(action: Action, selected_user: Option<&str>) -> Result<i32> {
                 let user = runtime::resolve_user(selected_user)?;
                 initialize_if_needed(&user.home)?;
             }
+
             show()?;
             return Ok(0);
         }
         Action::Edit { list, editor } => (list, editor),
     };
+
     runtime::check_interactive().context("config edit requires a foreground terminal")?;
     let preferred = editor.or_else(|| {
         ["VISUAL", "EDITOR"]
@@ -133,6 +145,7 @@ pub(crate) fn run(action: Action, selected_user: Option<&str>) -> Result<i32> {
             .filter_map(|key| env::var(key).ok())
             .find(|value| !value.is_empty())
     });
+
     if !rustix::process::geteuid().is_root() {
         let mut args = vec!["edit", list.name()];
         if let Some(program) = preferred.as_deref() {
@@ -140,13 +153,16 @@ pub(crate) fn run(action: Action, selected_user: Option<&str>) -> Result<i32> {
         }
         return run_with_sudo(selected_user, &args);
     }
+
     let user = runtime::resolve_user(selected_user)?;
     initialize_if_needed(&user.home)?;
     let original = ConfigFiles::open()?.read(list)?;
+
     if let Some(edited) =
         editor::edit_text(&user, list.filename(), &original, preferred.as_deref())?
     {
         ConfigFiles::open()?.replace(list, &original, &edited)?;
+
         let mut out = io::stdout().lock();
         let palette = Palette::for_stream(&out);
         writeln!(

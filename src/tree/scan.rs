@@ -1,14 +1,16 @@
 //! Enumerate files selected by the rules beneath pinned root directories.
-use anyhow::{Context, Result, ensure};
-use rustix::{
-    fs::{self, OFlags},
-    io::Errno,
-};
+
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
+};
+
+use anyhow::{Context, Result, ensure};
+use rustix::{
+    fs::{self, OFlags},
+    io::Errno,
 };
 
 use super::{FileAccess, IgnoreRule, Root, Rule, root::DIR};
@@ -37,6 +39,7 @@ impl Tree {
             !paths.is_empty() && !patterns.is_empty(),
             "configure at least one root and pattern"
         );
+
         let roots = Root::open_list(paths)?;
         let rules = patterns
             .iter()
@@ -46,6 +49,7 @@ impl Tree {
             .iter()
             .map(|p| IgnoreRule::compile(p))
             .collect::<Result<_>>()?;
+
         Ok(Self {
             roots,
             rules,
@@ -69,6 +73,7 @@ impl Tree {
         {
             return false;
         }
+
         self.rules.iter().any(|rule| rule.covers_file(relative))
             && !self.excluded(absolute, relative, false)
     }
@@ -99,6 +104,7 @@ impl Tree {
             {
                 continue;
             }
+
             let mut dirs = vec![PathBuf::new()];
             while let Some(dir) = dirs.pop() {
                 let relative = if dir.as_os_str().is_empty() {
@@ -115,6 +121,7 @@ impl Tree {
                             .with_context(|| format!("scan directory {:?}", root.path.join(&dir)));
                     }
                 };
+
                 for entry in fs::Dir::read_from(&fd)? {
                     let entry = entry?;
                     let name = OsStr::from_bytes(entry.file_name().to_bytes());
@@ -125,6 +132,7 @@ impl Tree {
                     if child == Path::new(LEGACY_STAGE) {
                         continue;
                     }
+
                     let pinned = match root.open_beneath(&child, OFlags::PATH | OFlags::NOFOLLOW) {
                         Ok(fd) => fd,
                         Err(Errno::XDEV | Errno::LOOP | Errno::NOENT | Errno::NOTDIR) => {
@@ -135,6 +143,7 @@ impl Tree {
                                 .with_context(|| format!("inspect {:?}", root.path.join(&child)));
                         }
                     };
+
                     let meta = pinned.metadata()?;
                     let absolute = root.path.join(&child);
                     if meta.is_dir() {
@@ -146,6 +155,7 @@ impl Tree {
                     }
                 }
             }
+
             root.verified_id()?;
         }
         Ok(result)
@@ -154,12 +164,14 @@ impl Tree {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use rustix::fs::Mode;
     use std::collections::BTreeSet;
     use std::fs as disk;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::symlink;
+
+    use rustix::fs::Mode;
+
+    use super::*;
 
     fn tree(root: &Path) -> Tree {
         Tree::new(
@@ -179,6 +191,7 @@ mod tests {
         disk::create_dir_all(root.join("target"))?;
         disk::write(root.join("target/.env"), b"ignored")?;
         disk::write(root.join(".env.example"), b"public")?;
+
         let a = root.join(".env");
         let b = root
             .join("app/.secrets/keys")
@@ -189,9 +202,11 @@ mod tests {
         }
         symlink(&outside, root.join(".env.link"))?;
         symlink(workspace.path(), root.join("link"))?;
+
         let t = tree(&root.join("./"));
         let files = t.scan()?;
         assert_eq!(files.keys().collect::<Vec<_>>(), vec![&a, &b]);
+
         assert!(t.locate(&outside).is_err());
         assert!(t.locate(&root.join("dir/../../.env")).is_err());
         assert!(t.locate(&root.join("target/.env")).is_err());
@@ -220,6 +235,7 @@ mod tests {
                 disk::write(file, b"fixture")?;
             }
         }
+
         let mut ignores = vec![
             first.join("dir[1]").display().to_string(),
             second.join("dir1/").display().to_string(),
@@ -234,6 +250,7 @@ mod tests {
         ];
         let roots = [first.clone(), second.clone(), excluded_root.clone()];
         let make_tree = |ignores: &[String]| Tree::new(&roots, &["*".into()], ignores, 1000);
+
         let tree = make_tree(&ignores)?;
         let visible: BTreeSet<_> = tree.scan()?.into_keys().collect();
         let expected = [
@@ -253,6 +270,7 @@ mod tests {
         ] {
             assert!(tree.locate(&hidden).is_err());
         }
+
         ignores.push(first.display().to_string());
         assert!(
             make_tree(&ignores)?
@@ -260,6 +278,7 @@ mod tests {
                 .keys()
                 .all(|p| p.starts_with(&second))
         );
+
         assert!(IgnoreRule::compile("/where/../else").is_err());
         assert!(Rule::compile("/where/key").is_err());
         assert!(Rule::compile("secret\0key").is_err());
@@ -288,6 +307,7 @@ mod tests {
             disk::create_dir_all(file.parent().unwrap())?;
             disk::write(file, b"fixture")?;
         }
+
         let tree = Tree::new(
             &[root.into()],
             &["*".into()],
@@ -301,6 +321,7 @@ mod tests {
             ],
             1000,
         )?;
+
         let expected = [
             "nested/cache/key",
             "nested/app/generated/key",
@@ -335,6 +356,7 @@ mod tests {
         disk::write(&b, b"b")?;
         disk::hard_link(&a, root.path().join("alias"))?;
         fs::mkfifoat(fs::CWD, &fifo, Mode::RUSR | Mode::WUSR)?;
+
         let t = tree(root.path());
         let files = t.scan()?;
         assert!(files[&a].validate(t.uid).is_err());

@@ -1,4 +1,5 @@
 //! Admit a mutation, supervise file access, and release its journal and locks.
+
 use std::{ffi::OsString, fs::File, io::Write};
 
 use anyhow::{Context, Result, ensure};
@@ -57,6 +58,7 @@ pub(crate) fn run(
             ),
             None => attempt(registry, user, selection, request, None),
         }?;
+
         match result {
             Outcome::Done(code) => {
                 if reset.take().is_none() || code != 0 {
@@ -87,11 +89,14 @@ fn attempt(
     let entries = admission::operations(registry)?;
     let mut target = Target::resolve(registry, &entries, selection, user.uid, true)?;
     let existing = target.lock_existing(approved)?;
-    let saved = existing.as_ref().and_then(|s| match target.slot {
-        Slot::Default => s.manual_scope(),
-        _ => Some(s.scope()),
+
+    // Named, directory and manually opened sessions reuse their journaled rules.
+    let saved = existing.as_ref().and_then(|session| match target.slot {
+        Slot::Default => session.manual_scope(),
+        _ => Some(session.scope()),
     });
     let (scope, tree) = target.tree(user, user.uid, saved, existing.as_ref())?;
+
     if let Some(offer) = admission::reset_offer(
         registry,
         &entries,
@@ -102,19 +107,21 @@ fn attempt(
     )? {
         return Ok(Outcome::NeedsConfirmation(offer));
     }
+
     let hint = target.hint();
-    if let Some(s) = &existing {
+    if let Some(session) = &existing {
         ensure!(
-            !matches!(request, Mutation::Unlock) || s.is_manual_open(),
+            !matches!(request, Mutation::Unlock) || session.is_manual_open(),
             "an unfinished operation was found. {hint}"
         );
     }
     if request.command().is_some_and(<[OsString]>::is_empty) {
         runtime::check_interactive()?;
     }
+
     let signals = SessionSignals::install()?;
     let store = target.claim(registry, user.uid)?;
-    let op = Operation {
+    let operation = Operation {
         registry,
         store,
         slot: target.slot,
@@ -123,13 +130,15 @@ fn attempt(
         user,
         signals: &signals,
     };
+
     let mut admission = Some(admission);
     let result = match request {
-        Mutation::Lock => op.lock(existing, &mut admission),
-        Mutation::Unlock => op.open(None, existing, &mut admission),
-        Mutation::Session(command) => op.open(Some(command), existing, &mut admission),
+        Mutation::Lock => operation.lock(existing, &mut admission),
+        Mutation::Unlock => operation.open(None, existing, &mut admission),
+        Mutation::Session(command) => operation.open(Some(command), existing, &mut admission),
     };
-    let code = op.release_after(result, admission, &hint)?;
+
+    let code = operation.release_after(result, admission, &hint)?;
     ensure!(
         approved.is_none() || !signals.interrupted(),
         "reset was interrupted; the previous session is locked"
@@ -183,11 +192,13 @@ impl Operation<'_> {
         if !self.store.holds_lock() {
             return result;
         }
+
         let remaining = (|| -> Result<bool> {
             let _guard = match admission {
                 Some(guard) => guard,
                 None => self.registry.admission()?,
             };
+
             let session = self.store.load::<Session>()?;
             if session.is_some() {
                 self.store.release()?;
@@ -196,6 +207,7 @@ impl Operation<'_> {
             }
             Ok(session.is_some())
         })();
+
         let stderr = std::io::stderr();
         let palette = Palette::for_stream(&stderr);
         match remaining {
@@ -221,6 +233,7 @@ impl Operation<'_> {
             }
             _ => (),
         }
+
         result
     }
 
@@ -242,7 +255,7 @@ impl Operation<'_> {
 
     fn lock(&self, session: Option<Session>, admission: &mut Option<File>) -> Result<i32> {
         match session {
-            Some(mut s) => self.begin_close(&mut s)?,
+            Some(mut session) => self.begin_close(&mut session)?,
             None => {
                 Session::start(
                     &self.store,
@@ -253,6 +266,7 @@ impl Operation<'_> {
                 )?;
             }
         }
+
         drop(admission.take());
         self.close()?;
         AccessMessage::Locked.write(&mut std::io::stdout().lock())?;
@@ -272,9 +286,10 @@ impl Operation<'_> {
         };
         let fresh = existing.is_none();
         let mut session = match existing {
-            Some(s) => s,
+            Some(session) => session,
             None => Session::start(&self.store, &self.tree, self.user, &self.scope, phase)?,
         };
+
         // The durable scope now excludes competing operations during the file scan.
         drop(admission.take());
         let preflight = access::preflight(&self.tree, self.user).and_then(|files| {
@@ -294,12 +309,15 @@ impl Operation<'_> {
                 return Err(e);
             }
         };
+
         if !fresh {
             session.phase(&self.store, phase)?;
         }
+
         let interactive = command.is_some_and(<[OsString]>::is_empty);
         let result = (|| -> Result<i32> {
             access::open_files(&self.tree, self.user, &files, || self.signals.interrupted())?;
+
             if let Some(command) = command {
                 session.phase(&self.store, Phase::Running)?;
                 AccessMessage::Unlocked.session(interactive, &self.slot, &self.scope)?;
@@ -311,6 +329,7 @@ impl Operation<'_> {
                 Ok(0)
             }
         })();
+
         if command.is_none() && result.is_ok() {
             return result;
         }
@@ -321,6 +340,7 @@ impl Operation<'_> {
                 Err(e) => format!("operation failed ({e:#}); closing also failed"),
                 Ok(_) => "closing the session failed".to_string(),
             })?;
+
         if command.is_some() {
             AccessMessage::Locked.session(interactive, &self.slot, &self.scope)?;
         } else {

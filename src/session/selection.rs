@@ -1,4 +1,5 @@
 //! Interpret the optional session name or directory and select its registry slot.
+
 use std::{
     ffi::OsString,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -79,6 +80,7 @@ fn absolute_root(path: &Path) -> Result<PathBuf> {
         !path.as_os_str().is_empty() && !path.components().any(|c| c == Component::ParentDir),
         "use a directory path without '..'"
     );
+
     let absolute = if path.is_absolute() {
         path.to_owned()
     } else {
@@ -124,6 +126,7 @@ impl Selection {
                 return Ok((Slot::Named(name.to_owned()), root));
             }
         };
+
         // Prefer an open record at this exact location even after replacement.
         // Recovery then reports the original inode mismatch instead of creating a new slot.
         if let Some(entry) = entries
@@ -132,6 +135,7 @@ impl Selection {
         {
             return Ok((entry.slot.clone(), Some(direct)));
         }
+
         let fd = std::fs::File::from(
             fs::openat2(
                 fs::CWD,
@@ -142,8 +146,9 @@ impl Selection {
             )
             .with_context(|| format!("open session directory {direct:?}"))?,
         );
-        let m = fd.metadata()?;
-        let slot = Slot::Direct((m.dev(), m.ino()));
+        let metadata = fd.metadata()?;
+        let slot = Slot::Direct((metadata.dev(), metadata.ino()));
+
         if let Some(entry) = entries.iter().find(|e| e.slot == slot)
             && let Some(original) = entry.root()
         {

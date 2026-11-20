@@ -1,4 +1,5 @@
 //! Installed rule lists, their effective session scope and the `config` command.
+
 mod commands;
 mod editor;
 mod files;

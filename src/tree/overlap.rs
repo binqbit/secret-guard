@@ -1,5 +1,6 @@
 //! A bind mount gives a directory a second pathname. Compare roots both in the
 //! mount namespace and at their locations inside the underlying filesystem.
+
 use std::ffi::OsString;
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -26,6 +27,7 @@ fn decode_path(field: &[u8]) -> Result<PathBuf> {
         path.push((octal[0] - b'0') * 64 + (octal[1] - b'0') * 8 + (octal[2] - b'0'));
         path.extend_from_slice(rest);
     }
+
     ensure!(!path.contains(&0), "invalid NUL in mount path");
     let path = PathBuf::from(OsString::from_vec(path));
     ensure!(
@@ -47,12 +49,14 @@ impl Location {
             .split(|&b| b == b'\n')
             .find_map(|line| line.strip_prefix(prefix.as_bytes()))
             .context("mount of pinned search root is missing from this mount namespace")?;
+
         // Fields after the ID: parent ID, major:minor, root on filesystem, mount point.
         let mut fields = line.split(|&b| b == b' ').skip(1);
         let device = std::str::from_utf8(fields.next().context("missing mount device")?)?;
         let (major, minor) = device.split_once(':').context("invalid mount device")?;
         let root = decode_path(fields.next().context("missing filesystem root")?)?;
         let mount_point = decode_path(fields.next().context("missing mount point")?)?;
+
         let relative = visible_path.strip_prefix(&mount_point).with_context(|| {
             format!("pinned path {visible_path:?} is outside mount point {mount_point:?}")
         })?;
@@ -69,6 +73,7 @@ impl Location {
             "search root moved: {:?}",
             root.path
         );
+
         let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", root.fd.as_raw_fd()))?;
         let mount_id = info
             .lines()
@@ -150,6 +155,7 @@ fn verify_mounts(table: &[u8]) -> Result<()> {
 fn validate_roots(roots: &[Root], require_disjoint: bool) -> Result<()> {
     let table = read_mounts()?;
     let candidates = locate(roots, &table)?;
+
     for reserved in RESERVED_ROOTS.map(Path::new) {
         let area = Location::reserved(reserved, &table)?;
         for candidate in &candidates {
@@ -160,6 +166,7 @@ fn validate_roots(roots: &[Root], require_disjoint: bool) -> Result<()> {
             );
         }
     }
+
     if require_disjoint {
         for (i, candidate) in candidates.iter().enumerate() {
             for peer in &candidates[..i] {
@@ -172,6 +179,7 @@ fn validate_roots(roots: &[Root], require_disjoint: bool) -> Result<()> {
             }
         }
     }
+
     for root in roots {
         root.verified_id()?;
     }
@@ -199,6 +207,7 @@ pub(crate) fn overlapping_roots(
 ) -> Result<Option<(PathBuf, PathBuf)>> {
     let saved = Root::open_list(paths).context("reopen the other session's original roots")?;
     ensure!(saved.len() == ids.len(), "invalid saved session root count");
+
     let table = read_mounts()?;
     let candidates = locate(tree.roots(), &table)?;
     let mut overlap = None;
@@ -209,12 +218,14 @@ pub(crate) fn overlapping_roots(
             "restore the other session's original root directory: {:?}",
             peer.path
         );
+
         for candidate in &candidates {
             if candidate.overlaps(&located) {
                 overlap.get_or_insert_with(|| (candidate.root.path.clone(), peer.path.clone()));
             }
         }
     }
+
     for root in saved.iter().chain(tree.roots()) {
         root.verified_id()?;
     }
@@ -233,6 +244,7 @@ mod tests {
         let sibling = temp.path().join("api-tools");
         fs::create_dir_all(project.join("sub"))?;
         fs::create_dir(&sibling)?;
+
         let tree = |path: &Path| Tree::new(&[path.into()], &[".env".into()], &[], 1000);
         let enrolled = tree(&project)?;
         let paths = std::slice::from_ref(&project);
@@ -240,6 +252,7 @@ mod tests {
         assert!(overlapping_roots(&tree(&sibling)?, paths, &ids)?.is_none());
         assert!(overlapping_roots(&tree(&project.join("sub"))?, paths, &ids)?.is_some());
         assert!(overlapping_roots(&tree(temp.path())?, paths, &ids)?.is_some());
+
         fs::rename(&project, temp.path().join("moved"))?;
         fs::create_dir(&project)?;
         assert!(overlapping_roots(&tree(&sibling)?, paths, &ids).is_err());
@@ -252,6 +265,7 @@ mod tests {
         let parent = Location::from_mount_info(table, 23, Path::new("/work/a b"))?;
         let alias_child = Location::from_mount_info(table, 57, Path::new("/mnt/view/sub"))?;
         assert!(parent.overlaps(&alias_child));
+
         let sibling = Location::from_mount_info(table, 23, Path::new("/work/a bc"))?;
         assert!(!sibling.overlaps(&alias_child));
         let separate = Location::from_mount_info(table, 61, Path::new("/different/work/a b"))?;
@@ -267,6 +281,7 @@ mod tests {
         let table = read_mounts()?;
         let expected = Location::reserved(&path, &table)?;
         assert!(!path.exists());
+
         fs::create_dir_all(&path)?;
         let actual = Location::pinned(&Root::open(&path)?, &table)?;
         assert_eq!(actual.filesystem, expected.filesystem);
@@ -280,6 +295,7 @@ mod tests {
             decode_path(b"/a\\134b\\011c\\012\xff")?,
             PathBuf::from(OsString::from_vec(b"/a\\b\tc\n\xff".to_vec()))
         );
+
         for invalid in [
             b"/bad\\99".as_slice(),
             b"/bad\\400",

@@ -1,11 +1,14 @@
 //! Controlling terminal input and foreground ownership.
-use super::{SessionSignals, checked, signals::pending_signal};
-use crate::output::{Palette, Tone};
-use anyhow::{Context, Result, ensure};
+
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
+
+use anyhow::{Context, Result, ensure};
+
+use super::{SessionSignals, checked, signals::pending_signal};
+use crate::output::{Palette, Tone};
 
 pub fn check_interactive() -> Result<()> {
     foreground_terminal()?.context("this command requires a foreground controlling terminal")?;
@@ -16,11 +19,13 @@ pub fn confirm_session_reset(label: &str, kind: &str, roots: &[PathBuf]) -> Resu
     let Some(mut tty) = foreground_terminal()? else {
         return Ok(false);
     };
+
     let palette = Palette::for_stream(&tty);
     writeln!(tty, "{label} is {}.", palette.paint(Tone::Warning, kind))?;
     for root in roots {
         writeln!(tty, "  {root:?}")?;
     }
+
     writeln!(
         tty,
         "Enter keeps this session open and cancels the new request."
@@ -48,6 +53,7 @@ impl SessionSignals {
             }
             Ok(())
         }
+
         let Some(mut tty) = foreground_terminal()? else {
             list(&mut io::stderr().lock(), busy)?;
             anyhow::bail!("close the listed files and run 'sudo secret-guard lock' again");
@@ -57,6 +63,7 @@ impl SessionSignals {
             !self.interrupted(),
             "retry interrupted; close the listed files before recovery"
         );
+
         let palette = Palette::for_stream(&tty);
         writeln!(
             tty,
@@ -93,6 +100,7 @@ pub(super) fn foreground_terminal() -> Result<Option<File>> {
         }
         Err(e) => return Err(e.into()),
     };
+
     // A background command with redirected standard streams must not take
     // the terminal away from its foreground process group.
     let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
@@ -109,6 +117,7 @@ fn read_answer(tty: &mut File) -> io::Result<Option<Vec<u8>>> {
     // to distinguish an overlong answer from "yes"; discard the rest of that line.
     let mut answer = Vec::with_capacity(4);
     let mut byte = [0];
+
     while tty_ready(tty.as_raw_fd())? {
         match tty.read(&mut byte) {
             Ok(0) => break,
@@ -131,6 +140,7 @@ fn tty_ready(fd: RawFd) -> io::Result<bool> {
         events: libc::POLLIN,
         revents: 0,
     };
+
     while pending_signal() == 0 {
         let rc = unsafe { libc::poll(&mut entry, 1, 100) };
         if rc > 0 {
@@ -166,12 +176,14 @@ pub(super) fn set_foreground(fd: RawFd, group: i32) -> io::Result<()> {
         libc::sigemptyset(&mut blocked);
         libc::sigaddset(&mut blocked, libc::SIGTTOU);
         checked(libc::sigprocmask(libc::SIG_BLOCK, &blocked, &mut old))?;
+
         let result = loop {
             match checked(libc::tcsetpgrp(fd, group)) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 result => break result,
             }
         };
+
         checked(libc::sigprocmask(
             libc::SIG_SETMASK,
             &old,
@@ -180,6 +192,7 @@ pub(super) fn set_foreground(fd: RawFd, group: i32) -> io::Result<()> {
         result
     }
 }
+
 pub(super) struct Foreground<'a> {
     tty: &'a File,
     group: libc::pid_t,
@@ -208,8 +221,9 @@ impl Drop for Foreground<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Seek;
+
+    use super::*;
 
     #[test]
     fn reset_requires_an_explicit_complete_answer() -> Result<()> {
@@ -225,6 +239,7 @@ mod tests {
             let mut file = tempfile::tempfile()?;
             file.write_all(input.as_bytes())?;
             file.rewind()?;
+
             assert_eq!(read_confirmation(&mut file)?, expected, "{input:?}");
         }
         Ok(())
@@ -235,6 +250,7 @@ mod tests {
         let mut file = tempfile::tempfile()?;
         file.write_all(b"yes\n\n\n")?;
         file.rewind()?;
+
         assert!(read_confirmation(&mut file)?);
         assert!(read_enter(&mut file)?);
         assert!(read_enter(&mut file)?);

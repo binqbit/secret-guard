@@ -1,4 +1,5 @@
 //! Durable state for the default, named and directory sessions.
+
 mod persistence;
 mod registry;
 mod session;

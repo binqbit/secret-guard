@@ -1,4 +1,5 @@
 //! Inspect open sessions under the admission lock and detect conflicting requests.
+
 use std::{
     ffi::OsString,
     fs::File,
@@ -36,6 +37,7 @@ pub(crate) fn operations(registry: &JournalStore) -> Result<Vec<Entry>> {
     let mut slots = vec![Slot::Default];
     slots.extend(registry.names()?.into_iter().map(Slot::Named));
     slots.extend(registry.direct_ids()?.into_iter().map(Slot::Direct));
+
     let mut entries = Vec::new();
     for slot in slots {
         let store = slot
@@ -43,6 +45,7 @@ pub(crate) fn operations(registry: &JournalStore) -> Result<Vec<Entry>> {
             .context("session state disappeared")?;
         let idle = store.try_exclusive()?;
         let session = store.load()?;
+
         if !idle || session.is_some() {
             entries.push(Entry {
                 slot,
@@ -75,6 +78,7 @@ fn conflicts<'a>(
         let session = entry.session.as_ref().with_context(|| {
             format!("session {label} is busy; retry after its operation finishes")
         })?;
+
         let reason = if entry.slot == *selected {
             if session.is_manual_open() {
                 "files are manually unlocked".into()
@@ -92,6 +96,7 @@ fn conflicts<'a>(
                 "conflict with open session {label}: session roots overlap: {requested:?} and {open:?}"
             )
         };
+
         conflicts.push(Conflict {
             entry,
             session,
@@ -126,6 +131,7 @@ pub(super) fn reset_offer(
     command: Option<&[OsString]>,
 ) -> Result<Option<ResetOffer>> {
     let conflicts = conflicts(entries, selected, tree, command.is_some())?;
+
     // Check all blockers before offering to close any of them. A live or foreign
     // session still prevents the request even if a different journal is recoverable.
     for conflict in &conflicts {
@@ -148,6 +154,7 @@ pub(super) fn reset_offer(
             entry.slot.close_hint(entry.root())
         );
     }
+
     let Some(conflict) = conflicts.first() else {
         return Ok(None);
     };
@@ -156,6 +163,7 @@ pub(super) fn reset_offer(
         .slot
         .open(registry, false)?
         .context("session has already closed")?;
+
     Ok(Some(ResetOffer {
         selection: Selection::for_slot(&entry.slot, entry.root()),
         label: entry.slot.title(),

@@ -1,4 +1,14 @@
 //! Render session progress and file status for terminals and scripts.
+
+use std::{
+    collections::BTreeMap,
+    fs::OpenOptions,
+    io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
+};
+
+use anyhow::Result;
+
 use super::selection::Slot;
 use crate::{
     config::Scope,
@@ -6,13 +16,6 @@ use crate::{
     output::{Palette, Tone},
     runtime::User,
     tree::FileAccess,
-};
-use anyhow::Result;
-use std::{
-    collections::BTreeMap,
-    fs::OpenOptions,
-    io::{self, IsTerminal, Write},
-    path::{Path, PathBuf},
 };
 
 pub(super) enum AccessMessage {
@@ -41,6 +44,7 @@ impl AccessMessage {
                     writeln!(tty, "  {root:?}")?;
                 }
             }
+
             self.write(&mut tty)
         } else {
             self.write(&mut io::stderr().lock())
@@ -69,7 +73,7 @@ pub(super) fn describe(
     hint: &str,
     palette: &Palette,
 ) -> io::Result<()> {
-    let Some(s) = session else {
+    let Some(session) = session else {
         return if idle {
             writeln!(out, "No open session.")
         } else {
@@ -80,15 +84,17 @@ pub(super) fn describe(
             )
         };
     };
-    if s.is_manual_open() {
+
+    if session.is_manual_open() {
         return writeln!(
             out,
             "{} (user {:?}, UID {})",
             palette.paint(Tone::Open, "OPEN / manual"),
-            s.user,
-            s.uid
+            session.user,
+            session.uid
         );
     }
+
     let (activity, tone) = if idle {
         ("OPEN / recovery required", Tone::Warning)
     } else {
@@ -98,10 +104,10 @@ pub(super) fn describe(
         out,
         "{} ({:?}, user {:?}, UID {}, supervisor PID {})",
         palette.paint(tone, activity),
-        s.phase,
-        s.user,
-        s.uid,
-        s.pid
+        session.phase,
+        session.user,
+        session.uid,
+        session.pid
     )?;
     if idle {
         writeln!(out, "{}", palette.paint(Tone::Action, hint))?;
@@ -121,6 +127,7 @@ pub(super) fn show_files(
         }
         return Ok(());
     }
+
     let palette = Palette::for_stream(&out);
     let mut owner_width = "UID:GID".len();
     if palette.is_terminal() {
@@ -128,9 +135,11 @@ pub(super) fn show_files(
             writeln!(out, "\nNo files match the selected rules.")?;
             return Ok(());
         }
+
         for access in files.values() {
             owner_width = owner_width.max(format!("{}:{}", access.uid, access.gid).len());
         }
+
         writeln!(
             out,
             "\n{}",
@@ -145,6 +154,7 @@ pub(super) fn show_files(
             "ACCESS", "UID:GID"
         )?;
     }
+
     for (path, access) in files {
         let (label, tone) = if access.is_locked(user.uid) {
             ("locked", Tone::Locked)
@@ -156,6 +166,7 @@ pub(super) fn show_files(
             ("unmanaged or changed", Tone::Warning)
         };
         let owner = format!("{}:{}", access.uid, access.gid);
+
         if palette.is_terminal() {
             writeln!(
                 out,
@@ -172,16 +183,19 @@ pub(super) fn show_files(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::os::fd::AsFd;
+
+    use super::*;
 
     #[test]
     fn status_reports_a_closed_output_pipe_without_panicking() {
         let (reader, mut writer) = io::pipe().unwrap();
         drop(reader);
+
         let palette = Palette::for_stream(&writer.as_fd());
         let heading = session_heading(&mut writer, &Slot::Default, None, &palette).unwrap_err();
         let status = describe(&mut writer, None, true, "", &palette).unwrap_err();
+
         assert_eq!(heading.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(status.kind(), io::ErrorKind::BrokenPipe);
     }

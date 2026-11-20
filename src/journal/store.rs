@@ -1,4 +1,5 @@
 //! Pin and validate private state directories and serialize work in each slot.
+
 use std::cell::Cell;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -60,6 +61,7 @@ impl JournalStore {
             }
             Err(e) => return Err(e).context("open private state directory"),
         };
+
         // Covers a racing first open which observed the just-created directory.
         parent.sync_all()?;
         Self::from_directory(directory, uid, gid)
@@ -68,6 +70,7 @@ impl JournalStore {
     fn create_directory(parent: &File, name: &OsStr, uid: u32, gid: u32) -> Result<()> {
         let (stage, staged) = stage_directory(parent, ".secret-guard-state-", uid, gid)?;
         staged.sync_all()?;
+
         let source = stage
             .path()
             .file_name()
@@ -84,6 +87,7 @@ impl JournalStore {
             m.uid() == uid && m.gid() == gid && m.mode() & 0o7777 == 0o700,
             "state directory must be owned by {uid}:{gid} with mode 0700"
         );
+
         let store = Self {
             directory,
             uid,
@@ -114,6 +118,7 @@ impl JournalStore {
 
     pub(crate) fn release(&self) -> Result<()> {
         self.require_lock()?;
+
         loop {
             match fs::flock(&self.directory, FlockOperation::Unlock) {
                 Ok(()) => {
@@ -164,8 +169,9 @@ impl JournalStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs as disk;
+
+    use super::*;
 
     #[test]
     fn concurrent_first_opens_share_the_same_lock() -> Result<()> {
@@ -186,6 +192,7 @@ mod tests {
                 .map(|handle| handle.join().unwrap())
                 .collect::<Result<Vec<_>>>()
         })?;
+
         assert!(stores[0].try_exclusive()?);
         for contender in &stores[1..] {
             assert!(!contender.try_exclusive()?);
@@ -200,6 +207,7 @@ mod tests {
         let path = tmp.path().join("state");
         let store = JournalStore::open_test(&path)?;
         assert!(store.try_exclusive()?);
+
         for name in [
             "manifest.json",
             "file-123",
@@ -231,6 +239,7 @@ mod tests {
         assert!(first.holds_lock());
         assert!(!second.try_exclusive()?);
         assert!(!second.holds_lock());
+
         first.release()?;
         assert!(!first.holds_lock());
         assert!(second.try_exclusive()?);
@@ -246,11 +255,13 @@ mod tests {
         let state = tmp.path().join("state");
         let writer = JournalStore::open_test(&state)?;
         let reader = writer.reopen()?;
+
         assert!(writer.try_exclusive()?);
         assert!(!reader.try_exclusive()?);
         assert!(reader.save(&0).is_err());
         writer.save(&42)?;
         assert_eq!(reader.load::<u32>()?, Some(42));
+
         let moved = tmp.path().join("moved");
         disk::rename(&state, &moved)?;
         disk::create_dir(&state)?;
@@ -260,6 +271,7 @@ mod tests {
         assert_eq!(reopened.load::<u32>()?, Some(73));
         assert_eq!(reader.load::<u32>()?, Some(73));
         assert!(!state.join("session.json").exists());
+
         drop(writer);
         assert!(reader.try_exclusive()?);
         Ok(())
