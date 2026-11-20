@@ -1,23 +1,21 @@
 ---
 name: secret-guard
-description: Use when storing local credentials, wiring applications to secret files, or checking which files an agent can read or edit under Secret Guard.
+description: Use when choosing a protected credential path or wiring an application to a local secret file.
 ---
 
-# Local project secrets
+# Use project credentials
 
-- Store API keys, tokens, passwords and private keys under the project root’s `.secrets/`. Create credential files with mode `0600`.
-- Keep `.env`, `.env.*` and environment variables public-only. With `SERVICE_TOKEN_FILE=.secrets/service-token`, have the application read the file relative to the project root.
-- Add `.secrets/` to the root `.gitignore` before creating secrets. Verify with `git check-ignore -- .secrets/service-token`. Exclude it from workspace indexers too. If a credential was committed, recommend rotation.
-- Use dummy values in examples and tests. Keep real values out of source code, command arguments, logs and chat.
+Read the installed lists in `/etc/secret-guard/` without sudo. Repository copies are templates. Skip blank lines and `#` comment lines.
 
-## Working with Secret Guard
+| List | How to interpret it |
+| --- | --- |
+| `.indexingfolders` | Default session roots. For a named or path session, use its selected directory. |
+| `.indexingsecrets` | `.env.*` matches names at any depth. `config/*.key` matches relative to each root. `.secrets/` covers its contents recursively. |
+| `.indexingignore` | An explicit session root wins over an exclusion covering that root or its parent. Within the selected root, exclusions win over secret patterns. The same glob rules apply. Entries starting with `./` or `/` are literal paths. For example, `./fixtures/` skips that tree under each root and `/srv/api/fixtures/` skips that absolute tree. |
 
-Read the installed rules in `/etc/secret-guard/` without sudo. Repository copies are templates. Check the selected project first. The default session uses `.indexingfolders`. A named or directory session uses its own root. The file must lie beneath a selected root and match `.indexingsecrets` (typically `.secrets/`). Exclusions in `.indexingignore` win, including absolute file or directory paths and exact root-relative paths beginning with `./`. On first use the file must belong to the opening user, who must be able to traverse the path. Scans skip symlinks and nested mounts. Report uncovered paths before relying on Secret Guard.
+If the lists changed during an open session, check that session’s `status` for its active selection.
 
-| File | Can read | Can write |
-| --- | --- | --- |
-| Installed rule list (`root:root 0644`) | All local users | Root |
-| Locked (`root:root 0600`) | Root | Root |
-| Unlocked (opening user's UID and primary group, `0600`) | Opening user and root | Opening user and root |
-
-Wait for `UNLOCKED` from an authorized `session` or manual `unlock`. Work as the opening user without sudo. Processes under that UID share access. Check `test -r "$path"` for reads or `test -w "$path"` for edits without printing the value. Release your file handles when finished. Use the same name or path for `status` and `lock`. For example, close `sudo secret-guard unlock api` with `sudo secret-guard lock api` as the opening user and confirm `LOCKED`. If another session holds overlapping roots, let its operator finish it.
+1. Store real keys, tokens and passwords in a covered regular file under the project's `.secrets/`, owned by the project user with mode `0600`. Avoid symlinks and nested mounts. If no path qualifies, ask for a covered location.
+2. Add `.secrets/` to `.gitignore`. Verify with `git check-ignore -- .secrets/service-token`. If the workspace indexer uses separate rules, exclude `.secrets/` there too.
+3. Keep `.env`, `.env.*` and exported variables public-only. For example, set `SERVICE_TOKEN_FILE=.secrets/service-token`. Have the application resolve the path from the project root and read the token at runtime.
+4. As the ordinary user, check `test -r "$path"` before reading or `test -w "$path"` before editing. If access is missing, tell the operator which path you need and wait. Keep credential values out of command arguments, logs, chat and Git. Use dummy values in examples and tests.
