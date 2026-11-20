@@ -21,6 +21,7 @@ use tree::Tree;
 #[derive(Parser)]
 #[command(
     version,
+    disable_help_subcommand = true,
     about = "Switch local files between public-read and root-only permissions"
 )]
 struct Cli {
@@ -38,10 +39,12 @@ enum Action {
         #[command(subcommand)]
         command: config::Action,
     },
-    /// List matching working files under the configured roots.
-    Scan,
     /// Show current file permissions and any open session.
-    Status,
+    Status {
+        /// List only paths matching the current configuration.
+        #[arg(long)]
+        paths: bool,
+    },
     /// Lock matching files, or safely finish an interrupted session.
     Lock,
     /// Open the files until Enter, or run a command as the session user.
@@ -190,23 +193,41 @@ fn run(cli: Cli) -> Result<i32> {
         );
     }
     let session: Option<Session> = store.load()?;
-    if matches!(action, Action::Status) {
+    if matches!(action, Action::Status { paths: false }) {
         describe(session.as_ref(), idle);
     } else if session.is_some() && idle {
         eprintln!("Unfinished operation found. {RECOVERY}");
     }
-    journal::initialize_if_needed(&user.home)?;
-    let scope = journal::read_config()?;
+    let saved_scope = match &action {
+        Action::Status { paths: false } => session.as_ref().map(Session::scope),
+        _ => None,
+    };
+    let scope = if let Some(scope) = saved_scope {
+        scope.clone()
+    } else {
+        journal::initialize_if_needed(&user.home)?;
+        journal::read_config()?
+    };
+    // A different sudo caller can inspect the recorded owner's file state.
+    let user = match (&action, &session) {
+        (Action::Status { paths: false }, Some(s)) if s.uid != user.uid => {
+            runtime::resolve_uid(s.uid)?
+        }
+        _ => user,
+    };
     let tree = Tree::new(&scope.roots, &scope.patterns, &scope.ignores, user.uid)?;
     match action {
         Action::Config { .. } => unreachable!(),
-        Action::Scan => {
+        Action::Status { paths: true } => {
             for path in tree.scan()?.keys() {
                 println!("{path:?}");
             }
             Ok(0)
         }
-        Action::Status => {
+        Action::Status { paths: false } => {
+            if let Some(s) = &session {
+                s.validate(&tree, user.uid, &scope)?;
+            }
             for (path, access) in tree.scan()? {
                 let label = if access.is_locked(user.uid) {
                     "locked"

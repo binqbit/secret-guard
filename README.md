@@ -57,10 +57,12 @@ Roots cannot overlap each other or the configuration and state directories. Use 
 
 ### 3. Preview the selection, then lock it
 
-Run these commands from the ordinary account that owns the project secrets. For a project with `.env`, `.secrets/service.key`, `.env.example` and `target/.env`, the example rules select two files. **Review the paths before the first lock.** Scanning leaves permissions as they are.
+Run these commands from the ordinary account that owns the project secrets. `status --paths` always lists matches for the currently installed rules. Full `status` reports access and permissions. While any operation is open, it scans using the roots and rules saved when that operation began, even if the installed lists have since changed.
+
+For a project with `.env`, `.secrets/service.key`, `.env.example` and `target/.env`, the example rules select two files. **Review the paths before the first lock.**
 
 ```console
-$ sudo secret-guard scan
+$ sudo secret-guard status --paths
 "/srv/work/api/.env"
 "/srv/work/api/.secrets/service.key"
 
@@ -166,7 +168,7 @@ sudo sh tests/session.sh ./target/release/secret-guard
 
 Git-aware workspace indexers skip build output, real environment files and `.secrets/`. Source, tests, documentation, `Cargo.lock`, the three list templates and sanitized environment examples remain visible. Use only dummy values in examples. For an indexer with its own exclusions, mirror the repository's [Git ignore rules](.gitignore).
 
-Secret Guard's own scan uses the three installed lists. A real `.env` can therefore stay out of your workspace index and still appear in `sudo secret-guard scan`.
+Secret Guard selects files using the three installed lists. A real `.env` can therefore stay out of your workspace index and still appear in `sudo secret-guard status --paths`.
 
 <details>
 <summary>Upgrading from an older configuration or storage format</summary>
@@ -180,7 +182,7 @@ sudo chmod 0755 /etc/secret-guard
 
 If the CLI reports an access ACL error after the upgrade, check the named file or directory. An ACL entry can still deny a particular user read access to a list or traversal through its parent. [Linux access control lists](https://man7.org/linux/man-pages/man5/acl.5.html)
 
-Finish any open session with the previously installed version. For a TOML configuration, put each former `roots` entry on its own line in `.indexingfolders`. Transfer `patterns` or the contents of `patterns_file` to `.indexingsecrets`, and the entries from `ignore_file` to `.indexingignore`. If the old `user` setting restricted callers, apply that restriction in your sudo policy. Run `scan` from the account that originally owned the files to check the migrated rules.
+Finish any open session with the previously installed version. For a TOML configuration, put each former `roots` entry on its own line in `.indexingfolders`. Transfer `patterns` or the contents of `patterns_file` to `.indexingsecrets`, and the entries from `ignore_file` to `.indexingignore`. If the old `user` setting restricted callers, apply that restriction in your sudo policy. Run `sudo secret-guard status --paths` from the account that originally owned the files to check the migrated selection.
 
 For a copy-based installation, recover the stored files with that version and retain its old state directory separately before installing this release. Secret Guard detects the old archive layout and stops before changing it.
 

@@ -81,7 +81,13 @@ chmod 0644 "$editor_home/.env"
 HOME=/root "$guard" status > first-status.out
 grep -Fx 'No open session.' first-status.out >/dev/null
 grep -Fx "public-read mode  1000:1000 0644  \"$editor_home/.env\"" first-status.out >/dev/null
+"$guard" status --paths > first-paths.out
+printf '"%s"\n' "$editor_home/.env" | cmp - first-paths.out
 cmp /etc/editor-defaults/.indexingfolders "$rules/.indexingfolders"
+
+# The top-level commands have distinct roles.
+if "$guard" scan > invalid-command.log 2>&1; then echo 'Accepted a top-level scan' >&2; exit 1; fi
+grep -F "unrecognized subcommand 'scan'" invalid-command.log >/dev/null
 
 # Reset rewrites exactly the three rules for the selected account.
 if "$guard" reset config > invalid-command.log 2>&1; then echo 'Accepted a top-level reset' >&2; exit 1; fi
@@ -200,17 +206,17 @@ extra='/var/lib/sg extra root'
 install -d -m 0755 -o 1000 -g 1000 "$extra"
 touch "$extra/new.token"
 chown 1000:1000 "$extra/new.token"
-"$guard" scan > scan.out
-grep -Fx "\"$work/.secrets/key\"" scan.out >/dev/null
-if grep -F 'new.token' scan.out >/dev/null; then echo 'Scanned outside configured roots' >&2; exit 1; fi
+"$guard" status --paths > paths.out
+grep -Fx "\"$work/.secrets/key\"" paths.out >/dev/null
+if grep -F 'new.token' paths.out >/dev/null; then echo 'Scanned outside configured roots' >&2; exit 1; fi
 printf '%s\n' "$extra" >> "$rules/.indexingfolders"
 printf '%s\n' '*.token' >> "$rules/.indexingsecrets"
 printf '%s\n' '.secrets/key' >> "$rules/.indexingignore"
-"$guard" scan > scan.out
-grep -Fx "\"$extra/new.token\"" scan.out >/dev/null
-if grep -F '.secrets/key' scan.out >/dev/null; then echo 'Updated exclusion was ignored' >&2; exit 1; fi
-(unset SUDO_UID; "$guard" --user editor scan) > direct.out
-cmp scan.out direct.out
+"$guard" status --paths > paths.out
+grep -Fx "\"$extra/new.token\"" paths.out >/dev/null
+if grep -F '.secrets/key' paths.out >/dev/null; then echo 'Updated exclusion was ignored' >&2; exit 1; fi
+(unset SUDO_UID; "$guard" --user editor status --paths) > direct.out
+cmp paths.out direct.out
 printf '%s\n' "$work" > "$rules/.indexingfolders"
 printf '%s\n' 'target/' > "$rules/.indexingignore"
 
@@ -261,6 +267,8 @@ locked() { [ "$(stat -c '%u:%g:%a' "$1")" = '0:0:600' ]; }
 locked .env && locked .secrets/key || exit 1
 if as_reader cat .env >/dev/null 2>&1; then echo 'Locked file is readable' >&2; exit 1; fi
 [ "$(stat -c '%u:%g:%a' target/.env)" = '1000:1000:640' ]
+"$guard" status > locked-status.out
+grep -Fx "locked  0:0 0600  \"$work/.env\"" locked-status.out >/dev/null
 
 "$guard" session -- /bin/sh -eu -c '
     [ "$(id -u)" = 1000 ]

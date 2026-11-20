@@ -32,6 +32,10 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
     pub fn start(
         store: &JournalStore,
         tree: &Tree,
