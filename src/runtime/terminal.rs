@@ -12,6 +12,28 @@ pub fn check_interactive() -> Result<()> {
     Ok(())
 }
 
+pub fn confirm_session_reset(label: &str, kind: &str, roots: &[PathBuf]) -> Result<bool> {
+    let Some(mut tty) = foreground_terminal()? else {
+        return Ok(false);
+    };
+    let palette = Palette::for_stream(&tty);
+    writeln!(tty, "{label} is {}.", palette.paint(Tone::Warning, kind))?;
+    for root in roots {
+        writeln!(tty, "  {root:?}")?;
+    }
+    writeln!(
+        tty,
+        "Enter keeps this session open and cancels the new request."
+    )?;
+    write!(
+        tty,
+        "Reset this session by locking its files, then continue? {} ",
+        palette.paint(Tone::Action, "[y/N]")
+    )?;
+    tty.flush()?;
+    read_confirmation(&mut tty)
+}
+
 impl SessionSignals {
     pub fn wait_for_retry(&self, busy: &[PathBuf]) -> Result<()> {
         fn list(out: &mut (impl Write + IsTerminal), busy: &[PathBuf]) -> io::Result<()> {
@@ -52,6 +74,12 @@ impl SessionSignals {
     }
 }
 
+fn read_confirmation(tty: &mut File) -> Result<bool> {
+    Ok(read_answer(tty)?.is_some_and(|answer| {
+        answer.eq_ignore_ascii_case(b"y") || answer.eq_ignore_ascii_case(b"yes")
+    }))
+}
+
 pub(super) fn foreground_terminal() -> Result<Option<File>> {
     let tty = match OpenOptions::new().read(true).write(true).open("/dev/tty") {
         Ok(tty) => tty,
@@ -73,17 +101,27 @@ pub(super) fn foreground_terminal() -> Result<Option<File>> {
 }
 
 pub(super) fn read_enter(tty: &mut File) -> Result<bool> {
-    let mut input = [0u8; 256];
+    Ok(read_answer(tty)?.is_some())
+}
+
+fn read_answer(tty: &mut File) -> io::Result<Option<Vec<u8>>> {
+    // Consume exactly one line, even on a noncanonical TTY. Four bytes suffice
+    // to distinguish an overlong answer from "yes"; discard the rest of that line.
+    let mut answer = Vec::with_capacity(4);
+    let mut byte = [0];
     while tty_ready(tty.as_raw_fd())? {
-        match tty.read(&mut input) {
-            Ok(0) => return Ok(false),
-            Ok(n) if input[..n].contains(&b'\n') => return Ok(true),
+        match tty.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => {
+                return Ok((pending_signal() == 0).then_some(answer));
+            }
+            Ok(_) if answer.len() < 4 => answer.push(byte[0]),
             Ok(_) => (),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 // The bounded poll also covers a signal arriving immediately before poll().
@@ -165,5 +203,42 @@ impl Drop for Foreground<'_> {
             // A killed editor may have left the TTY raw or echo disabled.
             let _ = change_termios(fd, &self.settings);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Seek;
+
+    #[test]
+    fn reset_requires_an_explicit_complete_answer() -> Result<()> {
+        for (input, expected) in [
+            ("YES\n", true),
+            ("y\n", true),
+            ("\n", false),
+            ("n\n", false),
+            ("yes please\n", false),
+            ("yes", false),
+            ("", false),
+        ] {
+            let mut file = tempfile::tempfile()?;
+            file.write_all(input.as_bytes())?;
+            file.rewind()?;
+            assert_eq!(read_confirmation(&mut file)?, expected, "{input:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reset_reads_only_its_own_answer() -> Result<()> {
+        let mut file = tempfile::tempfile()?;
+        file.write_all(b"yes\n\n\n")?;
+        file.rewind()?;
+        assert!(read_confirmation(&mut file)?);
+        assert!(read_enter(&mut file)?);
+        assert!(read_enter(&mut file)?);
+        assert!(!read_enter(&mut file)?);
+        Ok(())
     }
 }

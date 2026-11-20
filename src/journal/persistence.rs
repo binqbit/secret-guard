@@ -1,5 +1,6 @@
 //! Atomically publish session.json and recover interrupted writes under the slot lock.
 use std::fs::File;
+use std::os::unix::fs::MetadataExt;
 
 use anyhow::{Context, Result, ensure};
 use rustix::fs::{self, AtFlags, Mode, OFlags};
@@ -12,6 +13,23 @@ const SESSION: &str = "session.json";
 const PENDING: &str = ".session.pending";
 
 impl JournalStore {
+    pub(crate) fn pin_session(&self) -> Result<File> {
+        self.file(SESSION)?.context("session has already closed")
+    }
+
+    // Journal updates atomically replace the file. Keeping the approved inode
+    // open across the prompt also prevents its inode number from being reused.
+    pub(crate) fn verify_session(&self, expected: &File) -> Result<()> {
+        self.require_lock()?;
+        let current = self.pin_session()?.metadata()?;
+        let approved = expected.metadata()?;
+        ensure!(
+            (current.dev(), current.ino()) == (approved.dev(), approved.ino()),
+            "the session changed while awaiting confirmation; run session again"
+        );
+        Ok(())
+    }
+
     pub(crate) fn load<T: DeserializeOwned>(&self) -> Result<Option<T>> {
         self.check_layout()?;
         match self.file(SESSION)? {
@@ -85,7 +103,7 @@ impl JournalStore {
 mod tests {
     use super::*;
     use std::fs as disk;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
     fn commit_and_recover_only_session_metadata() -> Result<()> {

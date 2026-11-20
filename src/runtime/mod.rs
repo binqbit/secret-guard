@@ -10,7 +10,7 @@ pub(crate) use account::{User, resolve_uid, resolve_user};
 pub(crate) use command::COMMAND_PATH;
 pub(crate) use probe::check_file_access;
 pub(crate) use signals::SessionSignals;
-pub(crate) use terminal::check_interactive;
+pub(crate) use terminal::{check_interactive, confirm_session_reset};
 
 use std::io;
 

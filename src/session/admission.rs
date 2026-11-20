@@ -1,9 +1,13 @@
 //! Inspect open sessions under the admission lock and detect conflicting requests.
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    fs::File,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, ensure};
 
-use super::selection::Slot;
+use super::selection::{Selection, Slot};
 use crate::{
     journal::{JournalStore, Session},
     tree::{Tree, overlap},
@@ -50,20 +54,118 @@ pub(crate) fn operations(registry: &JournalStore) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-pub(super) fn check_other_roots(entries: &[Entry], selected: &Slot, tree: &Tree) -> Result<()> {
-    for other in entries.iter().filter(|other| other.slot != *selected) {
-        let label = other.slot.label(other.root());
-        let session = other.session.as_ref().with_context(|| {
+struct Conflict<'a> {
+    entry: &'a Entry,
+    session: &'a Session,
+    reason: String,
+}
+
+fn conflicts<'a>(
+    entries: &'a [Entry],
+    selected: &Slot,
+    tree: &Tree,
+    starting_session: bool,
+) -> Result<Vec<Conflict<'a>>> {
+    let mut conflicts = Vec::new();
+    for entry in entries
+        .iter()
+        .filter(|entry| starting_session || entry.slot != *selected)
+    {
+        let label = entry.slot.label(entry.root());
+        let session = entry.session.as_ref().with_context(|| {
             format!("session {label} is busy; retry after its operation finishes")
         })?;
-        if let Some((requested, open)) =
-            overlap::overlapping_roots(tree, &session.scope().roots, session.root_ids())
-                .with_context(|| format!("check roots of open session {label}"))?
-        {
-            bail!(
+        let reason = if entry.slot == *selected {
+            if session.is_manual_open() {
+                "files are manually unlocked".into()
+            } else {
+                "an unfinished operation was found".into()
+            }
+        } else {
+            let Some((requested, open)) =
+                overlap::overlapping_roots(tree, &session.scope().roots, session.root_ids())
+                    .with_context(|| format!("check roots of open session {label}"))?
+            else {
+                continue;
+            };
+            format!(
                 "conflict with open session {label}: session roots overlap: {requested:?} and {open:?}"
-            );
-        }
+            )
+        };
+        conflicts.push(Conflict {
+            entry,
+            session,
+            reason,
+        });
+    }
+    Ok(conflicts)
+}
+
+pub(super) fn check_other_roots(entries: &[Entry], selected: &Slot, tree: &Tree) -> Result<()> {
+    if let Some(conflict) = conflicts(entries, selected, tree, false)?.first() {
+        anyhow::bail!("{}", conflict.reason);
     }
     Ok(())
+}
+
+pub(super) struct ResetOffer {
+    pub selection: Selection,
+    pub journal: File,
+    pub label: String,
+    pub roots: Vec<PathBuf>,
+    pub kind: &'static str,
+    pub close_hint: String,
+}
+
+pub(super) fn reset_offer(
+    registry: &JournalStore,
+    entries: &[Entry],
+    selected: &Slot,
+    tree: &Tree,
+    uid: u32,
+    command: Option<&[OsString]>,
+) -> Result<Option<ResetOffer>> {
+    let conflicts = conflicts(entries, selected, tree, command.is_some())?;
+    // Check all blockers before offering to close any of them. A live or foreign
+    // session still prevents the request even if a different journal is recoverable.
+    for conflict in &conflicts {
+        let entry = conflict.entry;
+        ensure!(
+            entry.idle,
+            "{}; finish the active session in its own terminal",
+            conflict.reason
+        );
+        ensure!(
+            conflict.session.uid == uid,
+            "{}; the session belongs to UID {}",
+            conflict.reason,
+            conflict.session.uid
+        );
+        ensure!(
+            command.is_some_and(<[OsString]>::is_empty),
+            "{}. {}",
+            conflict.reason,
+            entry.slot.close_hint(entry.root())
+        );
+    }
+    let Some(conflict) = conflicts.first() else {
+        return Ok(None);
+    };
+    let entry = conflict.entry;
+    let store = entry
+        .slot
+        .open(registry, false)?
+        .context("session has already closed")?;
+    Ok(Some(ResetOffer {
+        selection: Selection::for_slot(&entry.slot, entry.root()),
+        label: entry.slot.title(),
+        roots: conflict.session.scope().roots.clone(),
+        journal: store.pin_session()?,
+        kind: if conflict.session.is_manual_open() {
+            "manually unlocked"
+        } else {
+            "awaiting recovery"
+        },
+        close_hint: entry.slot.close_hint(entry.root()),
+    }))
 }

@@ -163,6 +163,15 @@ For a one-off session, supply the path directly, for example `sudo secret-guard 
 
 Sessions with disjoint roots can run at the same time. An open session reserves its name and roots until closure, including during manual access and crash recovery. The same directory, a bind mount of it, and its parent and child directories all count as overlapping roots. This also applies to the default roots. If `api` is open, `lock api` addresses that session. A bare `lock` addresses the default session.
 
+### When an earlier session blocks a new one
+
+Suppose you manually unlocked `/srv/work/api` and then run `sudo secret-guard session` for the default root `/srv/work`. In a foreground terminal, Secret Guard identifies the open session and asks whether to reset it. The same prompt is available if your earlier supervisor exited before it finished locking. It applies to your own session when you select it again or request overlapping roots.
+
+- Type `y` or `yes` and press Enter to close the indicated session. Secret Guard locks its matching files, verifies closure, and then retries the session you requested. If a file is busy, release it and follow the retry prompt. After the new session reports `UNLOCKED`, Enter closes it as usual.
+- Press Enter at `[y/N]` to cancel the new request and leave the earlier session open. Any other answer or end of input also cancels. To restore the packaged configuration separately, use `config reset`.
+
+A running supervisor must finish in its own terminal. A session belonging to another UID must be closed by its original user. In command mode (`session -- COMMAND`) or without a foreground terminal, use `sudo secret-guard status` to identify the conflict. When you're ready to close your manual or interrupted session, target its original name or path, for example `sudo secret-guard lock /srv/work/api`, before retrying.
+
 ## If a file is busy or the session stops
 
 Before converting a file with broader permissions, such as an existing `0644` `.env`, to owner-only access, Secret Guard checks for open handles and memory mappings. If a process holds the file, release it, finish any pending close and then retry the opening command. When closing access, Secret Guard locks the files it can and lists the paths still in use.

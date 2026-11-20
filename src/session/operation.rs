@@ -1,10 +1,11 @@
 //! Admit a mutation, supervise file access, and release its journal and locks.
 use std::{ffi::OsString, fs::File, io::Write};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
 use super::{
-    access, admission,
+    access,
+    admission::{self, ResetOffer},
     display::AccessMessage,
     selection::{Selection, Slot},
     target::Target,
@@ -17,6 +18,7 @@ use crate::{
     tree::Tree,
 };
 
+#[derive(Clone, Copy)]
 pub(crate) enum Mutation<'a> {
     Lock,
     Unlock,
@@ -32,34 +34,80 @@ impl Mutation<'_> {
     }
 }
 
+enum Outcome {
+    Done(i32),
+    NeedsConfirmation(ResetOffer),
+}
+
 pub(crate) fn run(
     registry: &JournalStore,
     user: &User,
     selection: &Selection,
     request: Mutation<'_>,
 ) -> Result<i32> {
+    let mut reset: Option<ResetOffer> = None;
+    loop {
+        let result = match &reset {
+            Some(offer) => attempt(
+                registry,
+                user,
+                &offer.selection,
+                Mutation::Lock,
+                Some(&offer.journal),
+            ),
+            None => attempt(registry, user, selection, request, None),
+        }?;
+        match result {
+            Outcome::Done(code) => {
+                if reset.take().is_none() || code != 0 {
+                    return Ok(code);
+                }
+                // Confirmed closure succeeded. Recheck the original selection.
+            }
+            Outcome::NeedsConfirmation(offer) => {
+                ensure!(
+                    runtime::confirm_session_reset(&offer.label, offer.kind, &offer.roots)?,
+                    "new session cancelled. {}",
+                    offer.close_hint
+                );
+                reset = Some(offer);
+            }
+        }
+    }
+}
+
+fn attempt(
+    registry: &JournalStore,
+    user: &User,
+    selection: &Selection,
+    request: Mutation<'_>,
+    approved: Option<&File>,
+) -> Result<Outcome> {
     let admission = registry.admission()?;
     let entries = admission::operations(registry)?;
     let mut target = Target::resolve(registry, &entries, selection, user.uid, true)?;
-    let existing = target.lock_existing()?;
+    let existing = target.lock_existing(approved)?;
     let saved = existing.as_ref().and_then(|s| match target.slot {
         Slot::Default => s.manual_scope(),
         _ => Some(s.scope()),
     });
     let (scope, tree) = target.tree(user, user.uid, saved, existing.as_ref())?;
-    admission::check_other_roots(&entries, &target.slot, &tree)?;
+    if let Some(offer) = admission::reset_offer(
+        registry,
+        &entries,
+        &target.slot,
+        &tree,
+        user.uid,
+        request.command(),
+    )? {
+        return Ok(Outcome::NeedsConfirmation(offer));
+    }
     let hint = target.hint();
     if let Some(s) = &existing {
-        match &request {
-            Mutation::Session(_) if s.is_manual_open() => {
-                bail!("files are manually unlocked. {hint}")
-            }
-            Mutation::Session(_) => bail!("an unfinished operation was found. {hint}"),
-            Mutation::Unlock if !s.is_manual_open() => {
-                bail!("an unfinished operation was found. {hint}")
-            }
-            _ => (),
-        }
+        ensure!(
+            !matches!(request, Mutation::Unlock) || s.is_manual_open(),
+            "an unfinished operation was found. {hint}"
+        );
     }
     if request.command().is_some_and(<[OsString]>::is_empty) {
         runtime::check_interactive()?;
@@ -81,7 +129,12 @@ pub(crate) fn run(
         Mutation::Unlock => op.open(None, existing, &mut admission),
         Mutation::Session(command) => op.open(Some(command), existing, &mut admission),
     };
-    op.release_after(result, admission, &hint)
+    let code = op.release_after(result, admission, &hint)?;
+    ensure!(
+        approved.is_none() || !signals.interrupted(),
+        "reset was interrupted; the previous session is locked"
+    );
+    Ok(Outcome::Done(code))
 }
 
 struct Operation<'a> {

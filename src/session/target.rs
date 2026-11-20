@@ -1,5 +1,5 @@
 //! Resolve a selected slot to its binding, verified tree and journal.
-use std::path::PathBuf;
+use std::{fs::File, path::PathBuf};
 
 use anyhow::{Context, Result, ensure};
 
@@ -87,8 +87,12 @@ impl Target {
         Ok((scope, tree))
     }
 
-    pub(super) fn lock_existing(&self) -> Result<Option<Session>> {
+    pub(super) fn lock_existing(&self, approved: Option<&File>) -> Result<Option<Session>> {
         let Some(store) = &self.store else {
+            ensure!(
+                approved.is_none(),
+                "the confirmed session has already closed; run session again"
+            );
             return Ok(None);
         };
         ensure!(
@@ -96,6 +100,9 @@ impl Target {
             "session {} is already active; inspect it with status",
             self.slot.label(self.root.as_deref())
         );
+        if let Some(snapshot) = approved {
+            store.verify_session(snapshot)?;
+        }
         store.load()
     }
 

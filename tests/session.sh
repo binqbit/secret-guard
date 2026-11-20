@@ -637,6 +637,15 @@ wait_for_text() {
     echo "Timed out waiting for '$1' in $2" >&2
     return 1
 }
+# Feeding yes to a terminal must never take over a live supervisor or another UID.
+expect_no_reset() {
+    result=0
+    printf 'yes\n\n' | SHELL=/bin/sh timeout 5 script -eqfc "$1" /dev/null > forbidden-reset.log || result=$?
+    [ "$result" -eq 1 ] || { cat forbidden-reset.log >&2; exit 1; }
+    if grep -F '[y/N]' forbidden-reset.log >/dev/null; then
+        echo 'Offered an unauthorized or unattended reset' >&2; exit 1
+    fi
+}
 # The explicit root only needs the secret and ignore lists.
 mv "$rules/.indexingfolders" named-unused-folders
 if setsid --fork --wait "$guard" session unused-headless --path "$api" </dev/null > headless.out 2>&1; then
@@ -683,6 +692,7 @@ umount -n "$alias_dir"
 printf '%s\n' "$api" > "$rules/.indexingfolders"
 reject_scope lock
 reject_scope config reset
+expect_no_reset "$guard session"
 [ ! -e "$api/taken-over" ] && opened "$api/.env" && opened "$api/child/.env" || exit 1
 printf '%s\n' "$work" > "$rules/.indexingfolders"
 "$guard" lock
@@ -711,7 +721,20 @@ grep -F 'OPEN / recovery required' named-recovery.out >/dev/null
 reject_scope unlock service-api
 reject_scope unlock nested-recovery --path "$api/child"
 printf '%s\n' 'unused.fixture' > "$rules/.indexingsecrets"
-"$guard" lock service-api
+# Reopening the same named session after its supervisor died offers a safe reset.
+# The new selection is empty. During that session the old files must already be
+# locked using the saved rules, alongside the web project that stays unlocked.
+(
+    wait_for_text '[y/N]' recover-name.log || exit 1
+    printf 'y\n'
+    wait_for_text 'Press Enter to lock.' recover-name.log || exit 1
+    locked "$api/.env" && locked "$api/child/.env" && opened "$web/.env" || exit 1
+    touch reset-name-verified
+    printf '\n'
+) | SHELL=/bin/sh timeout 15 script -eqfc "$guard session service-api" /dev/null > recover-name.log
+[ -e reset-name-verified ]
+grep -F 'Reset' recover-name.log >/dev/null
+grep -F 'service-api' recover-name.log >/dev/null
 locked "$api/.env" && locked "$api/child/.env" && opened "$web/.env" || exit 1
 [ "$(cat "$api/.env")" = 'edited under api' ]
 if SUDO_UID=2000 "$guard" lock service-web > wrong-user.log 2>&1; then echo 'A different UID closed named manual access' >&2; exit 1; fi
@@ -794,6 +817,66 @@ trap - 0
 if [ "$peer_result" != 0 ]; then cat closing-peer.log >&2; exit "$peer_result"; fi
 locked "$web/.env"
 echo 'PASS: absolute and relative excludes, concurrent named and direct sessions, overlap rejection and targeted crash recovery'
+
+# Default project roots can contain a manually opened one-off directory. Only
+# its owner may reset it, and only in an interactive session without a command.
+"$guard" unlock "$api"
+printf '%s\n' "$projects" > "$rules/.indexingfolders"
+expect_no_reset "SUDO_UID=2000 $guard session"
+expect_no_reset "$guard session -- touch unexpected-work-command"
+[ ! -e unexpected-work-command ]
+result=0
+printf 'yes\n' | setsid --fork --wait "$guard" session > headless-reset.log 2>&1 || result=$?
+[ "$result" -eq 1 ] && opened "$api/.env" && locked "$web/.env" || exit 1
+if grep -F '[y/N]' headless-reset.log >/dev/null; then echo 'Prompted a headless session' >&2; exit 1; fi
+
+# Pressing Enter leaves the original journal and file permissions intact.
+result=0
+printf '\n' | SHELL=/bin/sh timeout 5 script -eqfc "$guard session" /dev/null > declined-reset.log || result=$?
+[ "$result" -eq 1 ] && opened "$api/.env" && locked "$web/.env" || exit 1
+grep -F '[y/N]' declined-reset.log >/dev/null
+grep -F "$api" declined-reset.log >/dev/null
+expect_tone 'manually unlocked' 33 declined-reset.log
+expect_tone 'Error' 31 declined-reset.log
+"$guard" status "$api" | grep -F 'OPEN / manual' >/dev/null
+[ ! -e /var/lib/secret-guard/session.json ]
+
+# An answer applies to the journal displayed in the prompt. Closing and
+# reopening the same directory while it waits must invalidate that consent.
+result=0
+(
+    wait_for_text '[y/N]' replaced-reset.log || exit 1
+    timeout 3 "$guard" lock "$api" >/dev/null || exit 1
+    timeout 3 "$guard" unlock "$api" >/dev/null || exit 1
+    touch reset-target-replaced
+    printf 'yes\n\n'
+) | SHELL=/bin/sh timeout 15 script -eqfc "$guard session" /dev/null > replaced-reset.log || result=$?
+[ "$result" -eq 1 ] && [ -e reset-target-replaced ] || exit 1
+opened "$api/.env" && locked "$web/.env" || exit 1
+"$guard" status "$api" | grep -F 'OPEN / manual' >/dev/null
+[ ! -e /var/lib/secret-guard/session.json ]
+
+# A yes response completes the old close, then starts the requested selection.
+# A different scope can still run while the terminal is waiting for an answer.
+printf '%s\n' '.env.fresh' > "$rules/.indexingsecrets"
+touch "$projects/.env.fresh"
+chown 1000:1000 "$projects/.env.fresh"
+chmod 0640 "$projects/.env.fresh"
+(
+    wait_for_text '[y/N]' recover-overlap.log || exit 1
+    timeout 3 "$guard" lock service-web >/dev/null || exit 1
+    printf 'yes\n'
+    wait_for_text 'Press Enter to lock.' recover-overlap.log || exit 1
+    locked "$api/.env" && opened "$projects/.env.fresh" && locked "$web/.env" || exit 1
+    touch reset-overlap-verified
+    printf '\n'
+) | SHELL=/bin/sh timeout 15 script -eqfc "$guard session" /dev/null > recover-overlap.log
+[ -e reset-overlap-verified ]
+grep -F 'Reset' recover-overlap.log >/dev/null
+grep -F "$api" recover-overlap.log >/dev/null
+locked "$projects/.env.fresh" && locked "$api/.env" && locked "$web/.env" || exit 1
+"$guard" status "$api" | grep -F 'No open session.' >/dev/null
+echo 'PASS: foreground reset choices, saved-scope close, and supervised, cross-UID and unattended refusals'
 
 # A directory selected explicitly can be inside an ignored tree. Independent
 # exclusions within the selected directory still apply, as do the secret rules.

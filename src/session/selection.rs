@@ -12,7 +12,7 @@ use rustix::fs::{self, Mode, OFlags, ResolveFlags};
 use super::admission::Entry;
 use crate::journal::{JournalStore, validate_session_name};
 
-#[derive(Args)]
+#[derive(Args, Default)]
 pub(crate) struct Selection {
     /// Saved session name, or a directory path (e.g. ./api).
     #[arg(value_name = "NAME_OR_PATH")]
@@ -93,6 +93,20 @@ fn absolute_root(path: &Path) -> Result<PathBuf> {
 }
 
 impl Selection {
+    pub(super) fn for_slot(slot: &Slot, root: Option<&Path>) -> Self {
+        match slot {
+            Slot::Default => Self::default(),
+            Slot::Named(name) => Self {
+                selector: Some(name.into()),
+                path: None,
+            },
+            Slot::Direct(_) => Self {
+                selector: None,
+                path: root.map(Path::to_owned),
+            },
+        }
+    }
+
     pub(super) fn resolve(&self, entries: &[Entry]) -> Result<(Slot, Option<PathBuf>)> {
         let root = self.path.as_deref().map(absolute_root).transpose()?;
         let direct = match self.selector.as_deref() {
