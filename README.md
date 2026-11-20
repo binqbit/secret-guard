@@ -53,7 +53,7 @@ secret-guard config edit ignore --editor nano
 
 Keep the directory owned by `root:root` with mode `0755` and each list owned by `root:root` with mode `0644`. Blank lines and whole-line `#` comments are ignored. Enter paths with spaces without quotes. Supply at least one root and one secret rule. The ignore list may be empty.
 
-Roots cannot overlap each other or the configuration and state directories, including through bind mounts. Use absolute paths without symlinks or `..`. The filesystem root (`/`) is refused. A name such as `.env` matches at any depth. A pattern such as `config/*.key` matches relative to each root. Scans skip symlinks and nested mounts. To scan a mounted project, list its mount point as a separate, non-overlapping root.
+Roots listed together in `.indexingfolders` must be disjoint. Every root must also be disjoint from the configuration and state directories, including through bind mounts. Use absolute paths without symlinks or `..`. The filesystem root (`/`) is refused. A name such as `.env` matches at any depth. A pattern such as `config/*.key` matches relative to each root. Scans skip symlinks and nested mounts. To scan a mounted project, list its mount point as a separate, non-overlapping root.
 
 The entries below illustrate how to exclude files and directory trees in `.indexingignore`. Each relative entry is interpreted from **each selected search root**. Paths starting with `./` or `/` are literal, so characters such as `*` and `[` in those paths refer to the filename itself. An absolute exclusion never adds a directory to the search.
 
@@ -161,7 +161,7 @@ The preview does not register the name. Once registered, a name identifies the s
 
 For a one-off session, supply the path directly, for example `sudo secret-guard session /srv/work/web`. From `/srv/work`, `sudo secret-guard session ./web` selects the same directory. A bare word such as `web` selects a saved name. You can also supply `--path DIR` without a name. After a manual `unlock ./web`, close it with `sudo secret-guard lock ./web` from the same working directory, or pass its absolute path.
 
-Sessions with disjoint roots can run at the same time. An open session reserves its name and roots until closure, including during manual access and crash recovery. The same directory, a bind mount of it, and its parent and child directories all count as overlapping roots. This also applies to the default roots. If `api` is open, `lock api` addresses that session. A bare `lock` addresses the default session.
+An open session reserves its name until closure, including during manual access and crash recovery. Two operations can run together if their roots are disjoint or the parent scan skips the entire nested project. For example, with `/srv/work` as the default root and `./api/` in its ignore list, `session` and `session /srv/work/api` can run concurrently. Closing the default session skips `api`, including new files there. Ignoring only `./api/fixtures/` still leaves an overlap. The check uses the rules each operation opened with and detects bind aliases. Two active operations cannot select the same physical directory.
 
 ### When an earlier session blocks a new one
 

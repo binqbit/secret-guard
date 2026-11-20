@@ -694,6 +694,14 @@ reject_scope lock
 reject_scope config reset
 expect_no_reset "$guard session"
 [ ! -e "$api/taken-over" ] && opened "$api/.env" && opened "$api/child/.env" || exit 1
+# The default scan stops at the ignored project. Its command can run beside
+# the live project and closing it must preserve access inside that project.
+printf '%s\n' "$projects" > "$rules/.indexingfolders"
+cp "$rules/.indexingignore" original-project-ignores
+printf '%s\n' './api/' "$web/local/" >> "$rules/.indexingignore"
+"$guard" session -- /bin/sh -eu -c 'test -w "$1" && test -w "$2"' sh "$web/.env" "$api/.env"
+locked "$web/.env" && opened "$api/.env" && opened "$api/child/.env" || exit 1
+cp original-project-ignores "$rules/.indexingignore"
 printf '%s\n' "$work" > "$rules/.indexingfolders"
 "$guard" lock
 "$guard" session service-web -- /bin/sh -ec 'test -w "$1"' sh "$web/.env"
@@ -901,6 +909,32 @@ printf '"%s"\n' "$selected/.env" "$nested_file" > expected-subsession.out
 "$guard" lock priority --path "$selected"
 locked "$selected/.env" && locked "$nested_file" || exit 1
 "$guard" status priority --paths | cmp - expected-subsession.out
+# A running default supervisor keeps its saved ignores. The nested project
+# may be selected explicitly even when an admin edits the current rules.
+"$guard" session -- sh -eu -c '
+    touch "$1/outer-ready"
+    for attempt in $(seq 1 100); do [ -e "$1/outer-done" ] && exit 0; sleep 0.1; done
+    exit 1
+' sh "$projects" > outer-supervisor.log 2>&1 &
+outer=$!
+trap 'touch "$projects/outer-done"; wait "$outer" || :' 0
+for attempt in $(seq 1 100); do
+    [ -e "$projects/outer-ready" ] && break
+    kill -0 "$outer" || exit 1
+    sleep 0.1
+done
+[ -e "$projects/outer-ready" ]
+cp "$rules/.indexingignore" outer-saved-ignores
+printf '%s\n' './fixtures/' "$selected/generated/" 'app/' '.env.example' > "$rules/.indexingignore"
+"$guard" unlock priority
+opened "$selected/.env"
+touch "$projects/outer-done"
+wait "$outer"
+trap - 0
+opened "$selected/.env"
+cp outer-saved-ignores "$rules/.indexingignore"
+"$guard" lock priority
+locked "$selected/.env"
 "$guard" unlock priority
 opened "$selected/.env" && opened "$nested_file" || exit 1
 printf '%s\n' "$selected/.env" >> "$rules/.indexingignore"

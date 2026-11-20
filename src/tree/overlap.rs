@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Root, Tree, descriptor_path, root::RESERVED_ROOTS};
+use super::{IgnoreRule, Root, Tree, descriptor_path, root::RESERVED_ROOTS};
 
 const MOUNTINFO: &str = "/proc/self/mountinfo";
 
@@ -37,6 +37,7 @@ fn decode_path(field: &[u8]) -> Result<PathBuf> {
     Ok(path)
 }
 
+#[derive(PartialEq, Eq)]
 struct Location {
     filesystem: u64,
     within_filesystem: PathBuf,
@@ -131,6 +132,53 @@ impl<'a> LocatedRoot<'a> {
             || self.id == other.id
             || self.location.overlaps(&other.location)
     }
+
+    fn selection_overlaps(
+        &self,
+        ignores: &[IgnoreRule],
+        other: &Self,
+        other_ignores: &[IgnoreRule],
+    ) -> bool {
+        if self.id == other.id
+            || self.root.path == other.root.path
+            || self.location == other.location
+        {
+            return true;
+        }
+        if ignores.iter().any(|r| r.excludes_root(&self.root.path))
+            || other_ignores
+                .iter()
+                .any(|r| r.excludes_root(&other.root.path))
+        {
+            return false;
+        }
+        self.reaches(other, ignores) || other.reaches(self, other_ignores)
+    }
+
+    fn reaches(&self, other: &Self, ignores: &[IgnoreRule]) -> bool {
+        // The scanner stops at the first ignored directory on the way down.
+        let included = |relative: &Path| {
+            !relative.ancestors().any(|dir| {
+                let visible = self.root.path.join(dir);
+                ignores
+                    .iter()
+                    .any(|rule| rule.excludes(&visible, dir, true))
+            })
+        };
+        // A bind mount can place a second visible path inside the same root.
+        // An excluded mount point alone says nothing about the backing path.
+        other
+            .root
+            .path
+            .strip_prefix(&self.root.path)
+            .is_ok_and(included)
+            || (self.location.filesystem == other.location.filesystem
+                && other
+                    .location
+                    .within_filesystem
+                    .strip_prefix(&self.location.within_filesystem)
+                    .is_ok_and(included))
+    }
 }
 
 fn locate<'a>(roots: &'a [Root], table: &[u8]) -> Result<Vec<LocatedRoot<'a>>> {
@@ -204,9 +252,11 @@ pub(crate) fn overlapping_roots(
     tree: &Tree,
     paths: &[PathBuf],
     ids: &[(u64, u64)],
+    saved_ignores: &[String],
 ) -> Result<Option<(PathBuf, PathBuf)>> {
     let saved = Root::open_list(paths).context("reopen the other session's original roots")?;
     ensure!(saved.len() == ids.len(), "invalid saved session root count");
+    let saved_ignores = IgnoreRule::compile_list(saved_ignores)?;
 
     let table = read_mounts()?;
     let candidates = locate(tree.roots(), &table)?;
@@ -220,7 +270,7 @@ pub(crate) fn overlapping_roots(
         );
 
         for candidate in &candidates {
-            if candidate.overlaps(&located) {
+            if candidate.selection_overlaps(&tree.ignores, &located, &saved_ignores) {
                 overlap.get_or_insert_with(|| (candidate.root.path.clone(), peer.path.clone()));
             }
         }
@@ -249,13 +299,110 @@ mod tests {
         let enrolled = tree(&project)?;
         let paths = std::slice::from_ref(&project);
         let ids = enrolled.root_ids()?;
-        assert!(overlapping_roots(&tree(&sibling)?, paths, &ids)?.is_none());
-        assert!(overlapping_roots(&tree(&project.join("sub"))?, paths, &ids)?.is_some());
-        assert!(overlapping_roots(&tree(temp.path())?, paths, &ids)?.is_some());
+        assert!(overlapping_roots(&tree(&sibling)?, paths, &ids, &[])?.is_none());
+        assert!(overlapping_roots(&tree(&project.join("sub"))?, paths, &ids, &[])?.is_some());
+        assert!(overlapping_roots(&tree(temp.path())?, paths, &ids, &[])?.is_some());
 
         fs::rename(&project, temp.path().join("moved"))?;
         fs::create_dir(&project)?;
-        assert!(overlapping_roots(&tree(&sibling)?, paths, &ids).is_err());
+        assert!(overlapping_roots(&tree(&sibling)?, paths, &ids, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn only_an_excluded_subtree_allows_nested_sessions_in_either_order() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let parent = temp.path().to_path_buf();
+        let projects = parent.join("projects");
+        let child = projects.join("api");
+        fs::create_dir_all(&child)?;
+        let secrets = [".env".into()];
+        let parent_paths = std::slice::from_ref(&parent);
+        let child_paths = std::slice::from_ref(&child);
+        let child_tree = Tree::new(child_paths, &secrets, &[], 1000)?;
+        let child_ids = child_tree.root_ids()?;
+        for (ignore, expected_conflict) in [
+            (format!("{}/", projects.display()), false),
+            ("./projects/api".into(), false),
+            ("projec*/".into(), false),
+            ("projects/a*/".into(), false),
+            ("./projects/api-other".into(), true),
+            ("projects".into(), true), // File glob, not a directory exclusion.
+            ("**/.env".into(), true),  // Matching currently selected files is insufficient.
+            ("./projects/api/fixtures/".into(), true),
+        ] {
+            let ignores = [ignore];
+            let parent_tree = Tree::new(parent_paths, &secrets, &ignores, 1000)?;
+            let parent_ids = parent_tree.root_ids()?;
+            assert_eq!(
+                overlapping_roots(&parent_tree, child_paths, &child_ids, &[])?.is_some(),
+                expected_conflict,
+                "requested parent ignores {ignores:?}"
+            );
+            assert_eq!(
+                overlapping_roots(&child_tree, parent_paths, &parent_ids, &ignores)?.is_some(),
+                expected_conflict,
+                "saved parent ignores {ignores:?}"
+            );
+        }
+
+        let ignored_root = [child.to_string_lossy().into_owned()];
+        let ignored_child = Tree::new(child_paths, &secrets, &ignored_root, 1000)?;
+        assert!(overlapping_roots(&ignored_child, child_paths, &child_ids, &[])?.is_some());
+        let parent_tree = Tree::new(parent_paths, &secrets, &[], 1000)?;
+        assert!(overlapping_roots(&parent_tree, child_paths, &child_ids, &ignored_root)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn each_root_pair_requires_its_own_directory_exclusion() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let parents = [temp.path().join("one"), temp.path().join("two")];
+        let children = [parents[0].join("api"), parents[1].join("api")];
+        for child in &children {
+            fs::create_dir_all(child)?;
+        }
+        let secrets = [".env".into()];
+        let ignores = [children[0].to_string_lossy().into_owned()];
+        let parent_tree = Tree::new(&parents, &secrets, &ignores, 1000)?;
+        let child_tree = Tree::new(&children, &secrets, &[], 1000)?;
+        assert_eq!(
+            overlapping_roots(&parent_tree, &children, &child_tree.root_ids()?, &[])?,
+            Some((parents[1].clone(), children[1].clone()))
+        );
+        assert_eq!(
+            overlapping_roots(&child_tree, &parents, &parent_tree.root_ids()?, &ignores)?,
+            Some((children[1].clone(), parents[1].clone()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ignoring_a_bind_alias_requires_covering_the_backing_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = Root::open(temp.path())?;
+        let mounted_at = temp.path().join("view");
+        fs::create_dir(&mounted_at)?;
+        let alias = Root::open(&mounted_at)?;
+        let table = read_mounts()?;
+        let parent = LocatedRoot::new(&root, &table)?;
+        let mut child = LocatedRoot::new(&alias, &table)?;
+        child.location.within_filesystem = parent.location.within_filesystem.join("backing");
+        let ignores = |entries: &[&str]| {
+            entries
+                .iter()
+                .map(|entry| IgnoreRule::compile(entry))
+                .collect::<Result<Vec<_>>>()
+        };
+        for single in ["view/", "backing/"] {
+            assert!(parent.selection_overlaps(&ignores(&[single])?, &child, &[]));
+        }
+        assert!(!parent.selection_overlaps(&ignores(&["view/", "backing/"])?, &child, &[]));
+        child
+            .location
+            .within_filesystem
+            .clone_from(&parent.location.within_filesystem);
+        assert!(parent.selection_overlaps(&ignores(&["view/", "backing/"])?, &child, &[]));
         Ok(())
     }
 

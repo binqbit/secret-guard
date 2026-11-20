@@ -63,6 +63,10 @@ pub(crate) enum IgnoreRule {
 }
 
 impl IgnoreRule {
+    pub(super) fn compile_list(entries: &[String]) -> Result<Vec<Self>> {
+        entries.iter().map(|entry| Self::compile(entry)).collect()
+    }
+
     pub(crate) fn compile(entry: &str) -> Result<Self> {
         ensure!(!entry.contains('\0'), "invalid ignore entry {entry:?}");
 

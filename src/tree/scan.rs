@@ -20,7 +20,7 @@ const LEGACY_STAGE: &str = ".secret-guard-stage";
 pub(crate) struct Tree {
     roots: Vec<Root>,
     rules: Vec<Rule>,
-    ignores: Vec<IgnoreRule>,
+    pub(super) ignores: Vec<IgnoreRule>,
     pub(super) uid: u32,
 }
 
@@ -45,10 +45,7 @@ impl Tree {
             .iter()
             .map(|p| Rule::compile(p))
             .collect::<Result<_>>()?;
-        let ignores = ignores
-            .iter()
-            .map(|p| IgnoreRule::compile(p))
-            .collect::<Result<_>>()?;
+        let ignores = IgnoreRule::compile_list(ignores)?;
 
         Ok(Self {
             roots,

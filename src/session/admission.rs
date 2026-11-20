@@ -86,9 +86,13 @@ fn conflicts<'a>(
                 "an unfinished operation was found".into()
             }
         } else {
-            let Some((requested, open)) =
-                overlap::overlapping_roots(tree, &session.scope().roots, session.root_ids())
-                    .with_context(|| format!("check roots of open session {label}"))?
+            let Some((requested, open)) = overlap::overlapping_roots(
+                tree,
+                &session.scope().roots,
+                session.root_ids(),
+                &session.scope().ignores,
+            )
+            .with_context(|| format!("check roots of open session {label}"))?
             else {
                 continue;
             };
