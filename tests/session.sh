@@ -21,6 +21,22 @@ templates=$2
 mount -n -t tmpfs -o mode=0755,nodev,nosuid tmpfs /etc
 mount -n -t tmpfs -o mode=0755,nodev,nosuid tmpfs /var/lib
 export SUDO_UID=1000
+# A color-capable terminal is explicit so tests are independent of the host.
+export TERM=xterm
+unset NO_COLOR
+escape=$(printf '\033')
+expect_tone() {
+    if ! grep -Fi "$1" "$3" | grep -E "${escape}\[([0-9]+;)*$2(;[0-9]+)*m" >/dev/null; then
+        echo "Missing terminal color $2 on the '$1' line in $3" >&2
+        return 1
+    fi
+}
+plain_output() {
+    if grep -F "$escape" "$1" >/dev/null; then
+        echo "Unexpected terminal escape in $1" >&2
+        return 1
+    fi
+}
 cat > /etc/passwd <<'ACCOUNTS'
 root:x:0:0:Root:/root:/bin/sh
 editor:x:1000:1000:Editor:/var/lib/editor home:/bin/sh
@@ -114,12 +130,43 @@ grep -Fx "public-read mode  1000:1000 0644  \"$editor_home/.env\"" first-status.
 printf '"%s"\n' "$editor_home/.env" | cmp - first-paths.out
 cmp /etc/editor-defaults/.indexingfolders "$rules/.indexingfolders"
 
+# Interactive status explains its columns and highlights broadly readable files.
+SHELL=/bin/sh script -eqfc "$guard status" /dev/null </dev/null > status.tty
+expect_tone 'public-read mode' 33 status.tty
+for label in ACCESS UID:GID MODE PATH; do grep -F "$label" status.tty >/dev/null; done
+grep -F "$editor_home/.env" status.tty >/dev/null
+sed "s/${escape}\[[0-9;]*m//g" status.tty > status-without-styles.tty
+NO_COLOR=1 SHELL=/bin/sh script -eqfc "$guard status" /dev/null </dev/null > no-color.tty
+cmp status-without-styles.tty no-color.tty
+TERM=dumb SHELL=/bin/sh script -eqfc "$guard status" /dev/null </dev/null > dumb.tty
+plain_output dumb.tty
+grep -F 'public-read mode' dumb.tty >/dev/null
+plain_output first-status.out
+
+# --paths is usable as a list of paths even when stdout is a terminal.
+SHELL=/bin/sh script -eqfc "$guard status --paths" /dev/null </dev/null > paths.tty
+sed 's/\r$//' paths.tty | cmp - first-paths.out
+error_code=0
+SHELL=/bin/sh script -eqfc "$guard status never-registered" /dev/null </dev/null > error.tty || error_code=$?
+[ "$error_code" -eq 1 ]
+expect_tone Error 31 error.tty
+grep -F 'never-registered' error.tty >/dev/null
+plain_output no-user.log
+
+# Help and argument errors follow the actual output descriptor, even if the
+# caller's environment requests forced color from its own tools.
+CLICOLOR_FORCE=1 "$guard" session --help > plain-help.out
+plain_output plain-help.out
+SHELL=/bin/sh script -eqfc "$guard session --help" /dev/null </dev/null > help.tty
+expect_tone 'Usage:' 36 help.tty
+
 # The top-level commands have distinct roles.
 "$guard" --help | sed -n '/^Commands:/,/^Options:/{s/^  \([a-z][a-z]*\)  *.*/\1/p;}' > commands.out
 [ "$(wc -l < commands.out)" -eq 5 ]
 for name in config status lock unlock session; do grep -Fx "$name" commands.out >/dev/null; done
-if "$guard" scan > invalid-command.log 2>&1; then echo 'Accepted a top-level scan' >&2; exit 1; fi
+if CLICOLOR_FORCE=1 "$guard" scan > invalid-command.log 2>&1; then echo 'Accepted a top-level scan' >&2; exit 1; fi
 grep -F "unrecognized subcommand 'scan'" invalid-command.log >/dev/null
+plain_output invalid-command.log
 
 # Reset rewrites exactly the three rules for the selected account.
 if "$guard" reset config > invalid-command.log 2>&1; then echo 'Accepted a top-level reset' >&2; exit 1; fi
@@ -187,9 +234,19 @@ home_env="$editor_home/.env"
     exit 1
 ) | SHELL=/bin/sh timeout 15 script -eqfc "$guard session" /dev/null > private-tty.log
 [ -e private-tty-enter ]
+expect_tone 'Default session' 36 private-tty.log
+grep -F "$editor_home" private-tty.log >/dev/null
 grep -F "$(printf '\033[32mUNLOCKED\033[0m')" private-tty.log >/dev/null
 grep -F "$(printf '\033[31mLOCKED\033[0m')" private-tty.log >/dev/null
 locked "$home_env"
+SHELL=/bin/sh script -eqfc "$guard status" /dev/null </dev/null > locked.tty
+expect_tone 'locked' 31 locked.tty
+# Session lifecycle messages go to the command's terminal stderr. A redirected
+# child stdout contains exactly the requested work command's output.
+SHELL=/bin/sh script -eqfc "$guard session -- /bin/sh -c 'echo child-output' > child.out" /dev/null </dev/null > command.tty
+printf '%s\n' child-output | cmp - child.out
+expect_tone 'UNLOCKED' 32 command.tty
+expect_tone 'LOCKED' 31 command.tty
 child_code=0
 sh -c 'trap "" CHLD; exec "$1" session -- /bin/sh -c "exit 7"' sh "$guard" \
     > ignored-child.out 2> ignored-child.err || child_code=$?
@@ -206,6 +263,9 @@ locked "$home_env"
 locked "$home_env"
 if as_editor cat "$home_env" >/dev/null 2>&1; then echo 'Home secret still readable after session' >&2; exit 1; fi
 "$guard" unlock
+SHELL=/bin/sh script -eqfc "$guard status" /dev/null </dev/null > open.tty
+expect_tone 'OPEN / manual' 32 open.tty
+expect_tone 'owner-only mode' 32 open.tty
 [ "$(as_editor cat "$home_env")" = 'private session edit' ]
 [ "$(stat -c '%u:%g:%a' "$home_env")" = '1000:1000:600' ]
 [ "$(stat -c '%u:%g:%a' "$editor_home")" = '1000:1000:700' ]
@@ -266,6 +326,9 @@ inode=$(stat -c '%d:%i' .env)
 # Public configuration commands read the installed lists, even before the first scan.
 # Keep an empty rule list and a comment visible so an operator can diagnose them.
 printf '%s\n' '# review the paths before the first scan' "$work" > "$rules/.indexingfolders"
+# Configuration can contain arbitrary comments. A terminal must display a
+# control character as text, including when the operator disables color.
+printf '# sample comment with \033]2;demo\007\n' >> "$rules/.indexingfolders"
 : > "$rules/.indexingignore"
 chmod 0711 /etc
 as_reader env PATH=/no-sudo "$guard" config show > show.out
@@ -273,6 +336,17 @@ chmod 0755 /etc
 for entry in '[folders]' '[secrets]' '[ignore]' '# review the paths before the first scan' "$work" '.secrets/'; do
     grep -Fx "$entry" show.out >/dev/null
 done
+grep -F "$(printf '\033]2;demo\007')" show.out >/dev/null
+SHELL=/bin/sh script -eqfc "$guard config show" /dev/null </dev/null > config.tty
+for label in 'Search folders' 'Protected patterns' 'Ignored paths'; do
+    expect_tone "$label" 36 config.tty
+done
+if grep -F "$(printf '\033]')" config.tty >/dev/null; then
+    echo 'Config show emitted terminal control data from a comment' >&2; exit 1
+fi
+grep -F 'demo' config.tty >/dev/null
+NO_COLOR=1 SHELL=/bin/sh script -eqfc "$guard config show" /dev/null </dev/null > config-plain.tty
+plain_output config-plain.tty
 [ ! -e /var/lib/secret-guard ]
 printf '%s\n' 'target/' > "$rules/.indexingignore"
 cp "$rules/.indexingignore" before-edit

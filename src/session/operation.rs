@@ -12,6 +12,7 @@ use super::{
 use crate::{
     config::Scope,
     journal::{JournalStore, Phase, Session},
+    output::{Palette, Tone},
     runtime::{self, SessionSignals, User},
     tree::Tree,
 };
@@ -143,14 +144,20 @@ impl Operation<'_> {
             Ok(session.is_some())
         })();
         let stderr = std::io::stderr();
+        let palette = Palette::for_stream(&stderr);
         match remaining {
             Ok(true) if result.is_err() => {
-                let _ = writeln!(stderr.lock(), "Operation remains OPEN. {hint}");
+                let _ = writeln!(
+                    stderr.lock(),
+                    "{} {hint}",
+                    palette.paint(Tone::Warning, "Operation remains OPEN.")
+                );
             }
             Err(cleanup) => {
                 let _ = writeln!(
                     stderr.lock(),
-                    "Cannot confirm a locked state. Inspect it with status."
+                    "{} Inspect it with status.",
+                    palette.paint(Tone::Warning, "Cannot confirm a locked state.")
                 );
                 return Err(cleanup).with_context(|| match result {
                     Err(e) => {
@@ -167,9 +174,14 @@ impl Operation<'_> {
     fn begin_close(&self, session: &mut Session) -> Result<()> {
         if let Some(error) = session.begin_close(&self.store)? {
             let mut err = std::io::stderr().lock();
+            let palette = Palette::for_stream(&err);
             let _ = writeln!(
                 err,
-                "Could not update the closing phase before locking: {error:#}"
+                "{}: {error:#}",
+                palette.paint(
+                    Tone::Warning,
+                    "Could not update the closing phase before locking"
+                )
             );
         }
         Ok(())
@@ -237,7 +249,7 @@ impl Operation<'_> {
             access::open_files(&self.tree, self.user, &files, || self.signals.interrupted())?;
             if let Some(command) = command {
                 session.phase(&self.store, Phase::Running)?;
-                AccessMessage::Unlocked.session(interactive)?;
+                AccessMessage::Unlocked.session(interactive, &self.slot, &self.scope)?;
                 self.signals.run(self.user, command)
             } else {
                 ensure!(!self.signals.interrupted(), "manual unlock interrupted");
@@ -257,7 +269,7 @@ impl Operation<'_> {
                 Ok(_) => "closing the session failed".to_string(),
             })?;
         if command.is_some() {
-            AccessMessage::Locked.session(interactive)?;
+            AccessMessage::Locked.session(interactive, &self.slot, &self.scope)?;
         } else {
             AccessMessage::Locked.write(&mut std::io::stdout().lock())?;
         }

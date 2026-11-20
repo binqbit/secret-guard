@@ -11,6 +11,7 @@ use rustix::fs::{self as linux, AtFlags, Dir, Gid, Mode, OFlags, ResolveFlags, U
 use rustix::io::Errno;
 use tempfile::TempDir;
 
+use crate::output::{Palette, Tone};
 use crate::runtime::{self, SessionSignals, User};
 
 fn select_editor(preferred: Option<&str>) -> Result<OsString> {
@@ -130,9 +131,11 @@ pub(super) fn edit_text(
         Ok((edited != contents).then_some(edited))
     })();
     if let Err(error) = remove_drafts(&outer, &directory) {
+        let palette = Palette::for_stream(&std::io::stderr());
         let _ = writeln!(
             std::io::stderr().lock(),
-            "Could not clean up editor scratch directory {:?}: {error:#}",
+            "{} {:?}: {error:#}",
+            palette.paint(Tone::Warning, "Could not clean up editor scratch directory"),
             outer.path()
         );
     }

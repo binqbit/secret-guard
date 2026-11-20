@@ -1,8 +1,9 @@
 //! Controlling terminal input and foreground ownership.
 use super::{SessionSignals, checked, signals::pending_signal};
+use crate::output::{Palette, Tone};
 use anyhow::{Context, Result, ensure};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 
@@ -13,8 +14,13 @@ pub fn check_interactive() -> Result<()> {
 
 impl SessionSignals {
     pub fn wait_for_retry(&self, busy: &[PathBuf]) -> Result<()> {
-        fn list(out: &mut impl Write, busy: &[PathBuf]) -> io::Result<()> {
-            writeln!(out, "Files still in use:")?;
+        fn list(out: &mut (impl Write + IsTerminal), busy: &[PathBuf]) -> io::Result<()> {
+            let palette = Palette::for_stream(out);
+            writeln!(
+                out,
+                "{}",
+                palette.paint(Tone::Warning, "Files still in use:")
+            )?;
             for path in busy {
                 writeln!(out, "  {path:?}")?;
             }
@@ -29,7 +35,15 @@ impl SessionSignals {
             !self.interrupted(),
             "retry interrupted; close the listed files before recovery"
         );
-        writeln!(tty, "Close the listed files, then press Enter to retry.")?;
+        let palette = Palette::for_stream(&tty);
+        writeln!(
+            tty,
+            "{}",
+            palette.paint(
+                Tone::Action,
+                "Close the listed files, then press Enter to retry."
+            )
+        )?;
         ensure!(
             read_enter(&mut tty)?,
             "retry ended before Enter; the remaining files still need locking"

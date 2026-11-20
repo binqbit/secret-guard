@@ -3,6 +3,7 @@ use super::User;
 use super::child::{child_setup, child_status, inherited_descriptors};
 use super::signals::{SessionSignals, pending_signal, remember_signal};
 use super::terminal::{Foreground, foreground_terminal, read_enter};
+use crate::output::{Palette, Tone};
 use anyhow::{Context, Result, ensure};
 use rustix::process::{self, Pid, Signal};
 use std::env;
@@ -25,7 +26,12 @@ impl SessionSignals {
         if command.is_empty() {
             let mut tty =
                 foreground_terminal()?.context("a foreground controlling terminal is required")?;
-            writeln!(tty, "Press Enter to lock.")?;
+            let palette = Palette::for_stream(&tty);
+            writeln!(
+                tty,
+                "{}",
+                palette.paint(Tone::Action, "Press Enter to lock.")
+            )?;
             let _ = read_enter(&mut tty)?;
             return Ok(if self.interrupted() {
                 128 + pending_signal()

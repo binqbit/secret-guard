@@ -11,6 +11,7 @@ use super::editor;
 use super::files::{self, ConfigFiles, initialize_if_needed};
 use super::rules::RuleList;
 use crate::journal::JournalStore;
+use crate::output::{Palette, Tone, terminal_text};
 use crate::{runtime, session};
 
 #[derive(Subcommand)]
@@ -30,19 +31,38 @@ pub(crate) enum Action {
 }
 
 fn show() -> Result<()> {
-    let files = ConfigFiles::open()?;
-    let mut output = String::new();
-    for (list, contents) in files.read_all()? {
-        if !output.is_empty() {
-            output.push('\n');
+    let lists = ConfigFiles::open()?.read_all()?;
+    let mut out = io::stdout().lock();
+    let palette = Palette::for_stream(&out);
+    for (index, (list, contents)) in lists.into_iter().enumerate() {
+        if index > 0 {
+            writeln!(out)?;
         }
-        output.push_str(&format!("[{}]\n", list.name()));
-        output.push_str(&contents);
-        if !output.ends_with('\n') {
-            output.push('\n');
+        if palette.is_terminal() {
+            let heading = match list {
+                RuleList::Folders => "Search folders",
+                RuleList::Secrets => "Protected patterns",
+                RuleList::Ignore => "Ignored paths",
+            };
+            writeln!(
+                out,
+                "{}  {}",
+                palette.paint(Tone::Heading, heading),
+                list.filename()
+            )?;
+            if contents.is_empty() {
+                writeln!(out, "  (no entries)")?;
+            } else {
+                out.write_all(terminal_text(&contents).as_bytes())?;
+            }
+        } else {
+            writeln!(out, "[{}]", list.name())?;
+            out.write_all(contents.as_bytes())?;
+        }
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            writeln!(out)?;
         }
     }
-    io::stdout().lock().write_all(output.as_bytes())?;
     Ok(())
 }
 
@@ -80,9 +100,12 @@ fn reset(selected_user: Option<&str>) -> Result<i32> {
     }
     files::reset_config(&user.home)?;
     drop(admission);
+    let mut out = io::stdout().lock();
+    let palette = Palette::for_stream(&out);
     writeln!(
-        io::stdout().lock(),
-        "Restored the three installed rule lists to their packaged defaults."
+        out,
+        "{} the three installed rule lists to their packaged defaults.",
+        palette.paint(Tone::Action, "Restored")
     )?;
     Ok(0)
 }
@@ -124,7 +147,14 @@ pub(crate) fn run(action: Action, selected_user: Option<&str>) -> Result<i32> {
         editor::edit_text(&user, list.filename(), &original, preferred.as_deref())?
     {
         ConfigFiles::open()?.replace(list, &original, &edited)?;
-        writeln!(io::stdout().lock(), "Saved {}.", list.filename())?;
+        let mut out = io::stdout().lock();
+        let palette = Palette::for_stream(&out);
+        writeln!(
+            out,
+            "{} {}.",
+            palette.paint(Tone::Action, "Saved"),
+            list.filename()
+        )?;
     } else {
         writeln!(io::stdout().lock(), "No changes to {}.", list.filename())?;
     }

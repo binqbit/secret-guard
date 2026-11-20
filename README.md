@@ -80,13 +80,15 @@ $ sudo secret-guard status --paths
 $ sudo secret-guard lock
 LOCKED
 
-$ sudo secret-guard status
+$ sudo secret-guard status | cat
 No open session.
 locked  0:0 0600  "/srv/work/api/.env"
 locked  0:0 0600  "/srv/work/api/.secrets/service.key"
 ```
 
-The first status line describes the operation. Each file line shows an access label, owner ID, group ID and mode. `locked` marks a root-protected file. `owner-only mode` identifies an eligible file owned by the working user at `0600`. A file already at `0644`, including one opened by an older release, can appear as `public-read mode`. Other mismatches appear as `unmanaged or changed`.
+The piped example shows the plain status format. Each file line shows an access label, owner ID, group ID and mode. `locked` marks a root-protected file. `owner-only mode` identifies an eligible file owned by the working user at `0600`. A file already at `0644`, including one opened by an older release, can appear as `public-read mode`. Other mismatches appear as `unmanaged or changed`.
+
+Run `sudo secret-guard status` directly to see the session name and a table of file permissions. Cyan headings group the output. Green marks open access, red marks locked files, and yellow draws attention to states such as required recovery. Every state has a text label. Set `NO_COLOR=1` or `TERM=dumb` to disable colors, for example `sudo NO_COLOR=1 secret-guard status`. Pipes and redirected streams use plain text. For a script that needs only paths, use `sudo secret-guard status --paths`.
 
 ### Reset the configuration
 
@@ -118,6 +120,8 @@ Closing a manual unlock uses its saved rules, even if you edited the installed l
 
 ```console
 $ sudo secret-guard session
+Default session
+  "/srv/work/api"
 UNLOCKED
 Press Enter to lock.
 ```
@@ -157,7 +161,7 @@ The preview does not register the name. Once registered, a name identifies the s
 
 For a one-off session, supply the path directly, for example `sudo secret-guard session /srv/work/web`. From `/srv/work`, `sudo secret-guard session ./web` selects the same directory. A bare word such as `web` selects a saved name. You can also supply `--path DIR` without a name. After a manual `unlock ./web`, close it with `sudo secret-guard lock ./web` from the same working directory, or pass its absolute path.
 
-Sessions with disjoint roots can run at the same time. An open session reserves its roots until closure, including during manual access and crash recovery. Reusing an active supervisor's name, selecting the same directory through a different name or bind mount, or selecting a parent or child of an open root is rejected. This also applies to the default roots. If `api` is open, `lock api` addresses that session. A bare `lock` addresses the default session and cannot take over `api`.
+Sessions with disjoint roots can run at the same time. An open session reserves its name and roots until closure, including during manual access and crash recovery. The same directory, a bind mount of it, and its parent and child directories all count as overlapping roots. This also applies to the default roots. If `api` is open, `lock api` addresses that session. A bare `lock` addresses the default session.
 
 ## If a file is busy or the session stops
 

@@ -3,12 +3,13 @@ compile_error!("Secret Guard requires Linux.");
 
 mod config;
 mod journal;
+mod output;
 mod runtime;
 mod session;
 mod storage;
 mod tree;
 
-use std::{ffi::OsString, io::Write, process::ExitCode};
+use std::{ffi::OsString, process::ExitCode};
 
 use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
@@ -18,6 +19,7 @@ use session::{Mutation, Selection};
 #[command(
     version,
     disable_help_subcommand = true,
+    styles = output::cli_styles(),
     about = "Switch selected files between owner-only and root-only access"
 )]
 struct Cli {
@@ -90,10 +92,20 @@ fn run(cli: Cli) -> Result<i32> {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    // Colorize otherwise uses stdout to decide even for stderr or /dev/tty.
+    // Each output site selects a style only for its own color-capable stream.
+    colored::control::set_override(true);
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            output::print_cli_message(&error);
+            return ExitCode::from(error.exit_code() as u8);
+        }
+    };
+    match run(cli) {
         Ok(code) => ExitCode::from(code as u8),
         Err(err) => {
-            let _ = writeln!(std::io::stderr().lock(), "secret-guard: {err:#}");
+            output::report_error(&err);
             ExitCode::FAILURE
         }
     }

@@ -1,4 +1,6 @@
 //! Snapshot session state and report the files in the requested scope.
+use std::io::Write;
+
 use anyhow::Result;
 
 use super::{
@@ -9,6 +11,7 @@ use super::{
 };
 use crate::{
     journal::{JournalStore, Session},
+    output::Palette,
     runtime::{self, User},
 };
 
@@ -43,32 +46,38 @@ pub(crate) fn status(
 
 fn describe_status(target: &Target, entries: &[Entry], selected: Option<&Entry>) -> Result<()> {
     let mut out = std::io::stdout().lock();
+    let palette = Palette::for_stream(&out);
     if target.slot == Slot::Default {
         let mut peers = entries
             .iter()
             .filter(|entry| entry.slot != Slot::Default)
             .peekable();
-        let show_default = peers.peek().is_some();
+        let show_default = peers.peek().is_some() || palette.is_terminal();
         for peer in peers {
-            display::session_heading(&mut out, &peer.slot, peer.root())?;
+            display::session_heading(&mut out, &peer.slot, peer.root(), &palette)?;
             display::describe(
                 &mut out,
                 peer.session.as_ref(),
                 peer.idle,
                 &peer.slot.close_hint(peer.root()),
+                &palette,
             )?;
+            if palette.is_terminal() {
+                writeln!(out)?;
+            }
         }
         if show_default {
-            display::session_heading(&mut out, &target.slot, None)?;
+            display::session_heading(&mut out, &target.slot, None, &palette)?;
         }
     } else {
-        display::session_heading(&mut out, &target.slot, target.root.as_deref())?;
+        display::session_heading(&mut out, &target.slot, target.root.as_deref(), &palette)?;
     }
     display::describe(
         &mut out,
         selected.and_then(|e| e.session.as_ref()),
         selected.is_none_or(|e| e.idle),
         &target.hint(),
+        &palette,
     )?;
     Ok(())
 }
