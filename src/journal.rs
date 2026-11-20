@@ -9,6 +9,8 @@ use rustix::fs::{self, AtFlags, Dir, FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 use serde::{Serialize, de::DeserializeOwned};
 
+use crate::tree::{acl_allows_public_read, check_directory_search};
+
 const CONFIG_DIR: &str = "/etc/secret-guard";
 const STATE: &str = "/var/lib/secret-guard";
 const SESSION: &str = "session.json";
@@ -18,8 +20,14 @@ fn directory_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
+#[derive(Clone, Copy)]
+enum Storage {
+    Rules,
+    Journal,
+}
+
 // Open each component relative to the checked parent. Keep the final descriptor pinned.
-fn trusted_directory(path: &Path) -> Result<File> {
+fn trusted_directory(path: &Path, storage: Storage) -> Result<File> {
     let mut directory = File::from(fs::open("/", directory_flags(), Mode::empty())?);
     for component in path.components() {
         if let Component::Normal(name) = component {
@@ -37,11 +45,20 @@ fn trusted_directory(path: &Path) -> Result<File> {
             meta.uid() == 0 && meta.mode() & 0o022 == 0,
             "{component:?} must be owned by root and disallow group and other writes"
         );
+        if matches!(storage, Storage::Rules) {
+            check_directory_search(&directory, Path::new(component.as_os_str()))?;
+        }
     }
     Ok(directory)
 }
 
-fn private_file(directory: &File, name: &str, uid: u32, gid: u32) -> Result<Option<File>> {
+fn checked_file(
+    directory: &File,
+    name: &str,
+    uid: u32,
+    gid: u32,
+    storage: Storage,
+) -> Result<Option<File>> {
     ensure!(
         !name.is_empty()
             && !matches!(name, "." | "..")
@@ -57,26 +74,45 @@ fn private_file(directory: &File, name: &str, uid: u32, gid: u32) -> Result<Opti
         Err(e) => return Err(e).with_context(|| format!("open {name:?}")),
     };
     let meta = file.metadata()?;
+    let mode = match storage {
+        Storage::Rules => 0o644,
+        Storage::Journal => 0o600,
+    };
     // Atomic journal replacement can unlink an already-open status reader's inode.
     ensure!(
         meta.is_file()
             && meta.nlink() <= 1
-            && meta.mode() & 0o7777 == 0o600
+            && meta.mode() & 0o7777 == mode
             && meta.uid() == uid
             && meta.gid() == gid,
-        "{name:?} must be a private regular file owned by {uid}:{gid} with mode 0600"
+        "{name:?} must be a regular file owned by {uid}:{gid} with mode {mode:04o} and no additional hard links"
     );
+    if matches!(storage, Storage::Rules) {
+        ensure!(
+            acl_allows_public_read(&file)?,
+            "{name:?} has an access ACL entry without read permission"
+        );
+    }
     Ok(Some(file))
 }
 
 pub fn read_config() -> Result<crate::Scope> {
-    let directory = trusted_directory(Path::new(CONFIG_DIR))?;
+    let directory = trusted_directory(Path::new(CONFIG_DIR), Storage::Rules).context(CONFIG_DIR)?;
     read_lists(&directory, 0, 0)
 }
 
 fn read_lists(directory: &File, uid: u32, gid: u32) -> Result<crate::Scope> {
+    let meta = directory.metadata()?;
+    ensure!(
+        meta.uid() == uid && meta.gid() == gid && meta.mode() & 0o7777 == 0o755,
+        "{CONFIG_DIR} must be owned by {uid}:{gid} with mode 0755"
+    );
+    ensure!(
+        acl_allows_public_read(directory)?,
+        "{CONFIG_DIR} has an access ACL entry without read permission"
+    );
     let lines = |name: &str| -> Result<Vec<String>> {
-        let mut file = private_file(directory, name, uid, gid)?
+        let mut file = checked_file(directory, name, uid, gid, Storage::Rules)?
             .with_context(|| format!("missing required configuration file {CONFIG_DIR}/{name}"))?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)
@@ -115,7 +151,7 @@ pub struct JournalStore {
 
 impl JournalStore {
     pub fn open() -> Result<Self> {
-        let parent = trusted_directory(Path::new("/var/lib"))?;
+        let parent = trusted_directory(Path::new("/var/lib"), Storage::Journal)?;
         Self::open_at(&parent, std::ffi::OsStr::new("secret-guard"), 0, 0).context(STATE)
     }
 
@@ -180,7 +216,7 @@ impl JournalStore {
     }
 
     fn file(&self, name: &str) -> Result<Option<File>> {
-        private_file(&self.directory, name, self.uid, self.gid)
+        checked_file(&self.directory, name, self.uid, self.gid, Storage::Journal)
     }
 
     fn check_layout(&self) -> Result<()> {
@@ -273,10 +309,11 @@ mod tests {
         let directory = File::open(tmp.path())?;
         let uid = directory.metadata()?.uid();
         let gid = directory.metadata()?.gid();
+        disk::set_permissions(tmp.path(), disk::Permissions::from_mode(0o755))?;
         let write = |name: &str, text: &str| -> Result<()> {
             let path = tmp.path().join(name);
             disk::write(&path, text)?;
-            disk::set_permissions(path, disk::Permissions::from_mode(0o600))?;
+            disk::set_permissions(path, disk::Permissions::from_mode(0o644))?;
             Ok(())
         };
         write(
@@ -293,6 +330,11 @@ mod tests {
         );
         assert_eq!(scope.patterns, [".env", ".secrets/"]);
         assert!(scope.ignores.is_empty());
+        for mode in [0o700, 0o750, 0o775, 0o777] {
+            disk::set_permissions(tmp.path(), disk::Permissions::from_mode(mode))?;
+            assert!(read_lists(&directory, uid, gid).is_err());
+        }
+        disk::set_permissions(tmp.path(), disk::Permissions::from_mode(0o755))?;
 
         write(".indexingignore", "target/\n.env.example\n")?;
         assert_eq!(
@@ -385,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_files_must_be_private_regular_siblings() -> Result<()> {
+    fn rule_files_must_be_public_readable_regular_siblings() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let parent = File::open(tmp.path())?;
         let uid = rustix::process::geteuid().as_raw();
@@ -400,16 +442,24 @@ mod tests {
             ".indexingsecrets/",
             "foo\0bar",
         ] {
-            assert!(private_file(&parent, name, uid, gid).is_err(), "{name:?}");
+            assert!(
+                checked_file(&parent, name, uid, gid, Storage::Rules).is_err(),
+                "{name:?}"
+            );
         }
         let rules = tmp.path().join(".indexingsecrets");
         disk::write(&rules, b".env\n")?;
-        disk::set_permissions(&rules, disk::Permissions::from_mode(0o600))?;
-        assert!(private_file(&parent, ".indexingsecrets", uid, gid)?.is_some());
+        disk::set_permissions(&rules, disk::Permissions::from_mode(0o644))?;
+        assert!(checked_file(&parent, ".indexingsecrets", uid, gid, Storage::Rules)?.is_some());
         symlink(&rules, tmp.path().join(".indexingignore"))?;
-        assert!(private_file(&parent, ".indexingignore", uid, gid).is_err());
-        disk::set_permissions(&rules, disk::Permissions::from_mode(0o640))?;
-        assert!(private_file(&parent, ".indexingsecrets", uid, gid).is_err());
+        assert!(checked_file(&parent, ".indexingignore", uid, gid, Storage::Rules).is_err());
+        for mode in [0o600, 0o640, 0o664, 0o646, 0o666] {
+            disk::set_permissions(&rules, disk::Permissions::from_mode(mode))?;
+            assert!(checked_file(&parent, ".indexingsecrets", uid, gid, Storage::Rules).is_err());
+        }
+        disk::set_permissions(&rules, disk::Permissions::from_mode(0o644))?;
+        disk::hard_link(&rules, tmp.path().join("another-link"))?;
+        assert!(checked_file(&parent, ".indexingsecrets", uid, gid, Storage::Rules).is_err());
         Ok(())
     }
 

@@ -18,17 +18,27 @@ On Linux 5.6 or later, use a recent stable Rust toolchain with Cargo. From the r
 ```sh
 cargo build --release --locked
 sudo install -D -o root -g root -m 0755 target/release/secret-guard /usr/local/bin/secret-guard
-sudo install -d -o root -g root -m 0700 /etc/secret-guard
-sudo install -o root -g root -m 0600 .indexingfolders .indexingsecrets .indexingignore /etc/secret-guard/
+sudo install -d -o root -g root -m 0755 /etc/secret-guard
+sudo install -o root -g root -m 0644 .indexingfolders .indexingsecrets .indexingignore /etc/secret-guard/
 ```
 
-For a binary update, run just the build and binary installation commands. If sudo cannot find `secret-guard`, use `/usr/local/bin/secret-guard` in its place.
+For a binary update, keep your installed lists. If they use the old private permissions, finish any open session with the installed binary first. Review the lists for paths, patterns and public comments, then update their permissions in place before replacing the binary.
+
+```sh
+sudo chmod 0644 /etc/secret-guard/.indexingfolders /etc/secret-guard/.indexingsecrets /etc/secret-guard/.indexingignore
+sudo chmod 0755 /etc/secret-guard
+```
+
+If the CLI reports an access ACL error after the upgrade, check the named file or directory. An ACL entry can still deny a particular user read access to a list or traversal through its parent. [Linux access control lists](https://man7.org/linux/man-pages/man5/acl.5.html)
+
+If sudo cannot find `secret-guard`, use `/usr/local/bin/secret-guard` in its place.
 
 ### 2. Choose where to look and what to protect
 
-Secret Guard reads three lists from **`/etc/secret-guard/`**. The files in this repository are templates. Edit the installed folder list first.
+Secret Guard reads three lists from **`/etc/secret-guard/`**. Any local user or agent can read them without sudo, including while secrets are locked. Only root can edit or replace the installed lists. Their paths, patterns and comments are public, so keep credential values in `.secrets/`. The files at the root of this repository are installation templates.
 
 ```sh
+cat /etc/secret-guard/.indexingfolders /etc/secret-guard/.indexingsecrets /etc/secret-guard/.indexingignore
 sudoedit /etc/secret-guard/.indexingfolders
 ```
 
@@ -40,7 +50,7 @@ Replace `/home/alice/work` with the absolute path of an existing project. The wa
 | [.indexingsecrets](.indexingsecrets) | Names or glob patterns of files to protect. A directory rule protects its contents recursively. | `.env`, `.env.*`, `.secrets/` |
 | [.indexingignore](.indexingignore) | Files to skip and directories to skip entirely. An ignore rule wins over a secret rule. | `.git/`, `target/`, `node_modules/`, `.env.example`, `.env.*.example` |
 
-Use `sudoedit` to change any of these lists. Keep them owned by `root:root` with mode `0600`. Blank lines and whole-line `#` comments are ignored. Enter paths with spaces without quotes. Supply at least one root and one secret rule. The ignore list may be empty.
+Use `sudoedit` to change any of these lists. Keep the directory owned by `root:root` with mode `0755` and each list owned by `root:root` with mode `0644`. Blank lines and whole-line `#` comments are ignored. Enter paths with spaces without quotes. Supply at least one root and one secret rule. The ignore list may be empty.
 
 Roots cannot overlap each other or the configuration and state directories. Use absolute paths without symlinks or `..`. The filesystem root (`/`) is refused. A name such as `.env` matches at any depth. A pattern such as `config/*.key` matches relative to each root. Scans skip symlinks and nested mounts. To scan a mounted project, list its mount point as a separate, non-overlapping root.
 

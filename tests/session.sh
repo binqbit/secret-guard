@@ -29,11 +29,18 @@ printf '%s\n' 'passwd: files' 'group: files' > /etc/nsswitch.conf
 
 work=/var/lib/sg-test-work
 rules=/etc/secret-guard
-install -d -m 0700 "$rules"
+as_reader() { setpriv --reuid=2000 --regid=2000 --clear-groups "$@"; }
+install -d -m 0755 "$rules"
 printf '%s\n' "$work" > "$rules/.indexingfolders"
 printf '%s\n' '.env' '.env.*' '.secrets/' > "$rules/.indexingsecrets"
 printf '%s\n' 'target/' > "$rules/.indexingignore"
-chmod 0600 "$rules/.indexingfolders" "$rules/.indexingsecrets" "$rules/.indexingignore"
+chmod 0644 "$rules/.indexingfolders" "$rules/.indexingsecrets" "$rules/.indexingignore"
+for name in .indexingfolders .indexingsecrets .indexingignore; do
+    file="$rules/$name"
+    as_reader cat "$file" >/dev/null
+    if as_reader sh -c ': >> "$1"' sh "$file" 2>/dev/null; then echo "Reader can write $name" >&2; exit 1; fi
+    if as_reader rm "$file" 2>/dev/null; then echo "Reader can remove $name" >&2; exit 1; fi
+done
 install -d -m 0755 -o 1000 -g 1000 "$work" "$work/.secrets" "$work/target"
 cd "$work"
 printf 'before\n' > .env
@@ -62,20 +69,48 @@ cmp scan.out direct.out
 printf '%s\n' "$work" > "$rules/.indexingfolders"
 printf '%s\n' 'target/' > "$rules/.indexingignore"
 
-# An absent or symlinked list must stop a lock before it changes any file.
+# Bad configuration must stop a lock before it changes any working file.
 original_access=$(stat -c '%u:%g:%a' .env)
+reject_lock() {
+    if "$guard" lock > invalid.log 2>&1; then echo "Accepted $1" >&2; exit 1; fi
+    [ "$(stat -c '%u:%g:%a' .env)" = "$original_access" ]
+}
 for name in .indexingfolders .indexingsecrets .indexingignore; do
     file="$rules/$name"
     mv "$file" "$file.saved"
-    if "$guard" lock > invalid.log 2>&1; then echo "Missing list accepted: $name" >&2; exit 1; fi
+    reject_lock "missing list $name"
     ln -s "$file.saved" "$file"
-    if "$guard" lock > invalid.log 2>&1; then echo "Symlinked list accepted: $name" >&2; exit 1; fi
+    reject_lock "symlinked list $name"
     rm "$file"
     mv "$file.saved" "$file"
-    [ "$(stat -c '%u:%g:%a' .env)" = "$original_access" ]
 done
+file="$rules/.indexingsecrets"
+for mode in 0600 0664 0646; do
+    chmod "$mode" "$file"
+    reject_lock "rule file with mode $mode"
+done
+chmod 0644 "$file"
+chown 1000:1000 "$file"
+reject_lock "rule file owned by the session user"
+chown 0:0 "$file"
+for mode in 0700 0775; do
+    chmod "$mode" "$rules"
+    reject_lock "configuration directory with mode $mode"
+done
+chmod 0755 "$rules"
+if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:2000:--- "$file"
+    reject_lock "rule file with a named ACL denying read"
+    setfacl -b "$file"
+    setfacl -m u:2000:r-- "$rules"
+    reject_lock "configuration directory with a named ACL denying traversal"
+    setfacl -b "$rules"
+    setfacl -m u:2000:r-- /etc
+    reject_lock "configuration ancestor with a named ACL denying traversal"
+    setfacl -b /etc
+    echo 'PASS: rule file, directory and ancestor ACL checks'
+fi
 
-as_reader() { setpriv --reuid=2000 --regid=2000 --clear-groups "$@"; }
 locked() { [ "$(stat -c '%u:%g:%a' "$1")" = '0:0:600' ]; }
 "$guard" lock
 locked .env && locked .secrets/key || exit 1
@@ -100,6 +135,9 @@ for attempt in $(seq 1 100); do
     sleep 0.1
 done
 [ -e ready ] || { echo 'Timed out waiting for the session' >&2; exit 1; }
+[ "$(stat -c '%u:%g:%a' /var/lib/secret-guard)" = '0:0:700' ]
+locked /var/lib/secret-guard/session.json
+if as_reader cat /var/lib/secret-guard/session.json >/dev/null 2>&1; then echo 'Reader can read private journal' >&2; exit 1; fi
 [ "$(stat -c '%u:%g:%a' .env)" = '1000:1000:644' ]
 [ "$(as_reader cat .env)" = edited ]
 [ "$(as_reader cat .secrets/key)" = recursive ]
@@ -130,9 +168,16 @@ grep -F 'sudo secret-guard lock' busy.log >/dev/null
 [ "$(stat -c '%u:%g:%a' .env.busy)" = '1000:1000:644' ]
 locked .env.available
 exec 3<&-
+# A permissions-only upgrade preserves both the operator's rules and recovery.
+chmod 0700 "$rules"
+chmod 0600 "$rules/.indexingfolders" "$rules/.indexingsecrets" "$rules/.indexingignore"
+if "$guard" lock > invalid.log 2>&1; then echo 'Old private configuration was accepted' >&2; exit 1; fi
+locked /var/lib/secret-guard/session.json
+chmod 0644 "$rules/.indexingfolders" "$rules/.indexingsecrets" "$rules/.indexingignore"
+chmod 0755 "$rules"
 "$guard" lock
 locked .env.busy
 [ "$(cat .env.busy)" = 'held reader fixture' ]
 [ -z "$(find /var/lib/secret-guard -mindepth 1 -print -quit)" ]
-printf '%s\n' 'PASS: public reads, root-only locking, stable inode, edits, closing rescan, exclusions and busy-file recovery'
+printf '%s\n' 'PASS: public reads, root-written rules, private journal, root-only locking, stable inode, edits, closing rescan, exclusions and busy-file recovery'
 GUEST

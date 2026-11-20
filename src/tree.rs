@@ -76,7 +76,7 @@ impl FileAccess {
                         .context("read trusted ownership marker; trusted xattrs are required");
                 }
             }
-            info.acl_allows_public_read = access_acl(pinned)?.is_none_or(|a| a.read_after_chmod);
+            info.acl_allows_public_read = acl_allows_public_read(pinned)?;
             Ok(())
         })();
         if let Err(error) = details {
@@ -137,6 +137,23 @@ fn access_acl(fd: &File) -> Result<Option<AclPermissions>> {
     let mut bytes = vec![0; size];
     let used = fs::getxattr(&proc_path, ACL, &mut bytes[..]).context("read access ACL")?;
     parse_acl(&bytes[..used]).map(Some)
+}
+
+/// Given readable owner, group and other mode bits, can every ACL entry read?
+pub(crate) fn acl_allows_public_read(fd: &File) -> Result<bool> {
+    Ok(access_acl(fd)?.is_none_or(|acl| acl.read_after_chmod))
+}
+
+pub(crate) fn check_directory_search(fd: &File, dir: &Path) -> Result<()> {
+    ensure!(
+        fd.metadata()?.mode() & 0o111 == 0o111,
+        "directory {dir:?} needs search permission for owner, group, and others to make the file publicly readable"
+    );
+    ensure!(
+        access_acl(fd)?.is_none_or(|acl| acl.all_can_search),
+        "directory {dir:?} has an access ACL entry without search permission"
+    );
+    Ok(())
 }
 
 // Linux UAPI posix_acl_xattr version 2 has a little-endian header and eight-byte
@@ -348,7 +365,7 @@ impl Tree {
             ] {
                 ensure!(
                     !path.starts_with(reserved) && !reserved.starts_with(path),
-                    "root overlaps private configuration or state: {path:?}"
+                    "root overlaps Secret Guard configuration or state: {path:?}"
                 );
             }
             ensure!(
@@ -475,14 +492,7 @@ impl Tree {
                 fs::openat2(fs::CWD, dir, DIR, Mode::empty(), ResolveFlags::NO_SYMLINKS)
                     .with_context(|| format!("inspect parent {dir:?}"))?,
             );
-            ensure!(
-                fd.metadata()?.mode() & 0o111 == 0o111,
-                "directory {dir:?} needs search permission for owner, group, and others to make the file publicly readable"
-            );
-            ensure!(
-                access_acl(&fd)?.is_none_or(|a| a.all_can_search),
-                "directory {dir:?} has an access ACL entry without search permission"
-            );
+            check_directory_search(&fd, dir)?;
         }
         Ok(())
     }
