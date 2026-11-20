@@ -189,6 +189,13 @@ home_env="$editor_home/.env"
 grep -F "$(printf '\033[32mUNLOCKED\033[0m')" private-tty.log >/dev/null
 grep -F "$(printf '\033[31mLOCKED\033[0m')" private-tty.log >/dev/null
 locked "$home_env"
+child_code=0
+sh -c 'trap "" CHLD; exec "$1" session -- /bin/sh -c "exit 7"' sh "$guard" \
+    > ignored-child.out 2> ignored-child.err || child_code=$?
+[ "$child_code" -eq 7 ]
+grep -F 'UNLOCKED' ignored-child.err >/dev/null
+grep -F 'LOCKED' ignored-child.err >/dev/null
+locked "$home_env"
 "$guard" session -- /bin/sh -eu -c '
     [ "$(stat -c %a "$HOME")" = 700 ]
     [ "$(stat -c "%u:%g:%a" "$HOME/.env")" = 1000:1000:600 ]

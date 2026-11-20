@@ -1,7 +1,8 @@
 use crate::tree::FileAccess;
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use nix::unistd::{Uid, User as Account, getgrouplist};
 use rustix::fs::{self, Access, AtFlags, Mode, OFlags, ResolveFlags};
+use rustix::process::{self, Pid, Signal, WaitOptions, WaitStatus};
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -96,30 +97,49 @@ extern "C" fn remember_signal(signal: i32) {
 
 pub struct SessionSignals {
     previous: Vec<(i32, libc::sigaction)>,
+    previous_mask: Option<libc::sigset_t>,
 }
 
 impl SessionSignals {
     pub fn install() -> Result<Self> {
         let mut guard = Self {
-            previous: Vec::with_capacity(SIGNALS.len() + 1),
+            previous: Vec::with_capacity(SIGNALS.len() + 2),
+            previous_mask: None,
         };
         SIGNAL.store(0, Ordering::Relaxed);
-        for signal in SIGNALS.into_iter().chain([libc::SIGIO]) {
+
+        for signal in SIGNALS.into_iter().chain([libc::SIGIO, libc::SIGCHLD]) {
             // A zeroed action has no flags. The handler only sets a lock-free atomic.
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
             // The filesystem worker checks for lease breaks with F_GETLEASE.
             // SIGIO must not terminate or cancel the supervisor.
-            action.sa_sigaction = if signal == libc::SIGIO {
-                libc::SIG_IGN
-            } else {
-                remember_signal as *const () as usize
+            action.sa_sigaction = match signal {
+                libc::SIGIO => libc::SIG_IGN,
+                // A launcher can ignore SIGCHLD. Linux then auto-reaps the probe
+                // or work command before the supervisor can collect its status.
+                libc::SIGCHLD => libc::SIG_DFL,
+                _ => remember_signal as *const () as usize,
             };
+
             let mut old = action;
             unsafe {
                 libc::sigemptyset(&mut action.sa_mask);
                 checked(libc::sigaction(signal, &action, &mut old))?;
             }
             guard.previous.push((signal, old));
+        }
+
+        // exec preserves the launcher's signal mask. Install all handlers
+        // before unblocking a pending interrupt in this single-threaded CLI.
+        unsafe {
+            let mut watched = std::mem::zeroed();
+            let mut old = std::mem::zeroed();
+            checked(libc::sigemptyset(&mut watched))?;
+            for signal in SIGNALS {
+                checked(libc::sigaddset(&mut watched, signal))?;
+            }
+            checked(libc::sigprocmask(libc::SIG_UNBLOCK, &watched, &mut old))?;
+            guard.previous_mask = Some(old);
         }
         Ok(guard)
     }
@@ -192,6 +212,12 @@ impl SessionSignals {
 
 impl Drop for SessionSignals {
     fn drop(&mut self) {
+        if let Some(mask) = &self.previous_mask {
+            unsafe {
+                libc::sigprocmask(libc::SIG_SETMASK, mask, std::ptr::null_mut());
+            }
+        }
+
         for (signal, action) in self.previous.iter().rev() {
             unsafe {
                 libc::sigaction(*signal, action, std::ptr::null_mut());
@@ -436,21 +462,8 @@ pub fn check_file_access(
         unsafe { libc::_exit(0) };
     }
     drop(writer);
-    let mut status = 0;
-    loop {
-        match checked(unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) }) {
-            Ok(()) if libc::WIFSTOPPED(status) => unsafe { libc::kill(pid, libc::SIGKILL) },
-            Ok(()) => break,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                if SIGNAL.load(Ordering::Relaxed) != 0 {
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                }
-                continue;
-            }
-            Err(error) => return Err(error).context("wait for file access check"),
-        };
-    }
-    let status = ExitStatus::from_raw(status);
+    let pid = Pid::from_raw(pid).context("missing access check process")?;
+    let status = wait_for_probe(pid, &reader).context("wait for file access check")?;
     if status.success() {
         return Ok(());
     }
@@ -472,6 +485,41 @@ pub fn check_file_access(
         "read and write"
     };
     Err(error).with_context(|| format!("UID {} could not {permission} {path:?}", user.uid))
+}
+
+fn child_status(pid: Pid) -> io::Result<Option<WaitStatus>> {
+    let status = rustix::io::retry_on_intr(|| {
+        process::waitpid(Some(pid), WaitOptions::NOHANG | WaitOptions::UNTRACED)
+    })?;
+    Ok(status.map(|(_, status)| status))
+}
+
+fn wait_for_probe(pid: Pid, reader: &io::PipeReader) -> io::Result<ExitStatus> {
+    // The worker closes its error pipe on exit. Its hangup wakes us promptly,
+    // while a bounded timeout covers cancellation just before poll and SIGSTOP.
+    let mut exit_pipe = libc::pollfd {
+        fd: reader.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+
+    loop {
+        if SIGNAL.load(Ordering::Relaxed) != 0 {
+            let _ = process::kill_process(pid, Signal::KILL);
+        }
+        if let Some(status) = child_status(pid)? {
+            if status.stopped() {
+                let _ = process::kill_process(pid, Signal::KILL);
+            } else {
+                return Ok(ExitStatus::from_raw(status.as_raw()));
+            }
+        }
+
+        match checked(unsafe { libc::poll(&mut exit_pipe, 1, 100) }) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        }
+    }
 }
 
 fn run_command(user: &User, mut cmd: Command, tty: Option<&File>) -> Result<i32> {
@@ -507,56 +555,60 @@ fn run_command(user: &User, mut cmd: Command, tty: Option<&File>) -> Result<i32>
     let child = cmd
         .spawn()
         .context("start working command as the session user")?;
-    let pid = child.id() as i32;
+    wait_for_command(Pid::from_child(&child))
+}
+
+fn signal_command(pid: Pid, signal: Signal) {
+    let _ = process::kill_process_group(pid, signal);
+
+    // A work command is free to change its own process group. It is still our
+    // unreaped child, so its PID remains valid even if the original group is gone.
+    if process::getpgid(Some(pid)).is_ok_and(|group| group != pid) {
+        let _ = process::kill_process(pid, signal);
+    }
+}
+
+fn wait_for_command(pid: Pid) -> Result<i32> {
     let mut terminating = None;
-    let mut stop_signal = 0;
+    let mut stopped = false;
+
     loop {
-        let mut status = 0;
-        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
-        if waited == pid {
-            if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
-                // Terminal-generated signals normally reach the foreground child
-                // group directly. Tell the transaction that this exit was interrupted.
-                if libc::WIFSIGNALED(status) {
-                    remember_signal(libc::WTERMSIG(status));
-                }
-                let signal = SIGNAL.load(Ordering::Relaxed);
-                return Ok(if signal != 0 {
-                    128 + signal
-                } else {
-                    libc::WEXITSTATUS(status)
-                });
-            }
-            if libc::WIFSTOPPED(status) {
-                stop_signal = libc::WSTOPSIG(status);
-                remember_signal(stop_signal);
+        if let Some(status) = child_status(pid).context("wait for working command")? {
+            if let Some(signal) = status.stopping_signal() {
+                stopped = true;
+                remember_signal(signal);
                 // A suspended job has to finish before its files can be relocked.
-                unsafe {
-                    libc::kill(-pid, libc::SIGCONT);
-                }
-            }
-        } else if waited < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            return Err(anyhow!(
-                "wait for working command: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        let signal = SIGNAL.load(Ordering::Relaxed);
-        if terminating.is_none() && (signal != 0 || stop_signal != 0) {
-            let forward = if stop_signal != 0 || signal == libc::SIGTSTP {
-                libc::SIGTERM
+                signal_command(pid, Signal::CONT);
             } else {
-                signal
-            };
-            unsafe {
-                libc::kill(-pid, forward);
+                // Terminal-generated signals usually reach the foreground child directly.
+                if let Some(signal) = status.terminating_signal() {
+                    remember_signal(signal);
+                }
+
+                let signal = SIGNAL.load(Ordering::Relaxed);
+                return if signal == 0 {
+                    status
+                        .exit_status()
+                        .context("missing work command exit status")
+                } else {
+                    Ok(128 + signal)
+                };
             }
+        }
+
+        let signal = SIGNAL.load(Ordering::Relaxed);
+        if terminating.is_none() && signal != 0 {
+            let forward = if stopped || signal == libc::SIGTSTP {
+                Signal::TERM
+            } else {
+                Signal::from_named_raw(signal).context("invalid session signal")?
+            };
+            signal_command(pid, forward);
             terminating = Some(Instant::now());
         } else if terminating.is_some_and(|start| start.elapsed() >= Duration::from_secs(3)) {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
+            signal_command(pid, Signal::KILL);
         }
+
         std::thread::sleep(Duration::from_millis(40));
     }
 }
@@ -567,5 +619,63 @@ mod tests {
     #[test]
     fn root_is_never_a_working_user() {
         assert!(resolve_uid(0).is_err());
+    }
+
+    #[test]
+    fn cancels_probe_if_signal_arrived_before_wait() -> Result<()> {
+        // The signal flag is process-wide. Exercise it in a fresh test process
+        // so concurrent terminal tests see their own normal signal state.
+        const CHILD: &str = "SECRET_GUARD_TEST_PROBE_WAIT";
+        if env::var_os(CHILD).is_none() {
+            let result = Command::new(env::current_exe()?)
+                .args([
+                    "--exact",
+                    "runtime::tests::cancels_probe_if_signal_arrived_before_wait",
+                ])
+                .env(CHILD, "1")
+                .output()?;
+            let summary = String::from_utf8_lossy(&result.stdout);
+            assert!(
+                result.status.success() && summary.contains("1 passed;"),
+                "{summary}"
+            );
+            return Ok(());
+        }
+
+        // Model an exec from a launcher whose calling thread blocked SIGTERM.
+        unsafe {
+            let mut blocked = std::mem::zeroed();
+            checked(libc::sigemptyset(&mut blocked))?;
+            checked(libc::sigaddset(&mut blocked, libc::SIGTERM))?;
+            checked(libc::sigprocmask(
+                libc::SIG_BLOCK,
+                &blocked,
+                std::ptr::null_mut(),
+            ))?;
+        }
+
+        let signals = SessionSignals::install()?;
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        assert!(signals.interrupted());
+
+        let (reader, writer) = io::pipe()?;
+        let child = Command::new("sleep")
+            .arg("5")
+            .stdout(std::process::Stdio::from(writer))
+            .spawn()?;
+        let status = wait_for_probe(Pid::from_child(&child), &reader)?;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+        drop(signals);
+        unsafe {
+            let mut mask = std::mem::zeroed();
+            checked(libc::sigprocmask(
+                libc::SIG_BLOCK,
+                std::ptr::null(),
+                &mut mask,
+            ))?;
+            assert_eq!(libc::sigismember(&mask, libc::SIGTERM), 1);
+        }
+        Ok(())
     }
 }
