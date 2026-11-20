@@ -491,7 +491,7 @@ locked .env && locked .env.new && locked .secrets/key || exit 1
 [ "$(cat .env)" = edited ] && [ "$(cat .env.new)" = new ] || exit 1
 [ "$(stat -c '%u:%g:%a' target/.env)" = '1000:1000:640' ]
 if as_reader cat .env >/dev/null 2>&1; then echo 'Closed file is still readable' >&2; exit 1; fi
-[ -z "$(find /var/lib/secret-guard -mindepth 1 -print -quit)" ]
+[ -z "$(find /var/lib/secret-guard -mindepth 1 ! -path /var/lib/secret-guard/.admission.lock -print -quit)" ]
 # Keep a Linux file description open in the parent shell. A headless close
 # must report that file, finish the independent file and leave recovery possible.
 printf 'held reader fixture\n' > .env.busy
@@ -521,6 +521,181 @@ chmod 0755 "$rules"
 "$guard" lock
 locked .env.busy
 [ "$(cat .env.busy)" = 'held reader fixture' ]
-[ -z "$(find /var/lib/secret-guard -mindepth 1 -print -quit)" ]
+[ -z "$(find /var/lib/secret-guard -mindepth 1 ! -path /var/lib/secret-guard/.admission.lock -print -quit)" ]
 printf '%s\n' 'PASS: owner-only reads, public configuration, private journal, root-only locking, stable inode, edits, closing rescan, exclusions and busy-file recovery'
+
+# Named sessions use their own root and inherit the installed secret/ignore rules.
+projects='/var/lib/scoped projects'
+api="$projects/api"
+web="$projects/api-extra"
+alias_dir="$projects/alias"
+install -d -o 1000 -g 1000 -m 0755 "$projects" "$api" "$api/child" "$api/cache[1]" \
+    "$web" "$web/cache[1]" "$web/local" "$web/deep/local" "$alias_dir"
+for file in "$api/.env" "$api/child/.env" "$api/.env.[key]" "$api/cache[1]/.env" \
+    "$web/.env" "$web/.env.[key]" "$web/cache[1]/.env" "$web/local/.env" "$web/deep/local/.env"; do
+    printf 'scoped fixture\n' > "$file"
+    chown 1000:1000 "$file"
+    chmod 0640 "$file"
+done
+printf '%s\n' '.env' '.env.*' > "$rules/.indexingsecrets"
+printf '%s\n' "$api/.env.[key]" "$api/cache[1]" './local/' > "$rules/.indexingignore"
+opened() { [ "$(stat -c '%u:%g:%a' "$1")" = '1000:1000:600' ]; }
+untouched() { [ "$(stat -c '%u:%g:%a' "$1")" = '1000:1000:640' ]; }
+reject_scope() {
+    if "$guard" "$@" > scope-rejected.log 2>&1; then
+        echo "Unexpected success for $*" >&2
+        exit 1
+    fi
+}
+# The explicit root only needs the secret and ignore lists.
+mv "$rules/.indexingfolders" named-unused-folders
+"$guard" lock service-api --path "$api"
+"$guard" status service-api --paths > api-paths.out
+mv named-unused-folders "$rules/.indexingfolders"
+"$guard" lock service-web --path "$web"
+locked "$api/.env" && locked "$api/child/.env" && locked "$web/.env" || exit 1
+untouched "$api/.env.[key]" && untouched "$api/cache[1]/.env" && untouched "$web/local/.env" || exit 1
+locked "$web/.env.[key]" && locked "$web/cache[1]/.env" && locked "$web/deep/local/.env" || exit 1
+printf '"%s"\n' "$api/.env" "$api/child/.env" | cmp - api-paths.out
+
+"$guard" session service-api -- /bin/sh -eu -c '
+    [ "$(id -u)" = 1000 ]
+    printf "edited under api\n" > "$1/.env"
+    touch "$1/ready"
+    for attempt in $(seq 1 400); do sleep 0.1; done
+    exit 1
+' sh "$api" > named-session.log 2>&1 &
+supervisor=$!
+trap 'kill "$supervisor" 2>/dev/null || :; wait "$supervisor" 2>/dev/null || :' 0
+for attempt in $(seq 1 100); do
+    [ -e "$api/ready" ] && break
+    kill -0 "$supervisor" 2>/dev/null || { wait "$supervisor"; exit 1; }
+    sleep 0.1
+done
+[ -e "$api/ready" ] && opened "$api/.env" && opened "$api/child/.env" || exit 1
+reject_scope session service-api -- touch "$api/taken-over"
+reject_scope lock service-api
+reject_scope lock "$api"
+reject_scope unlock "$api/child"
+reject_scope unlock service-api --path "$web"
+reject_scope lock another --path "$api"
+reject_scope lock nested --path "$api/child"
+reject_scope lock outer --path "$projects"
+mount -n --bind "$api/child" "$alias_dir"
+reject_scope lock alias --path "$alias_dir"
+umount -n "$alias_dir"
+printf '%s\n' "$api" > "$rules/.indexingfolders"
+reject_scope lock
+reject_scope config reset
+[ ! -e "$api/taken-over" ] && opened "$api/.env" && opened "$api/child/.env" || exit 1
+printf '%s\n' "$work" > "$rules/.indexingfolders"
+"$guard" lock
+"$guard" session service-web -- /bin/sh -ec 'test -w "$1"' sh "$web/.env"
+locked "$web/.env" && opened "$api/.env" || exit 1
+"$guard" unlock service-web
+opened "$web/.env" && opened "$api/.env" || exit 1
+# A peer's root can move inside this root after both have been admitted.
+mv "$api" "$web/moved-api"
+reject_scope lock service-web
+opened "$web/.env" && opened "$web/moved-api/.env" || exit 1
+mv "$web/moved-api" "$api"
+"$guard" status > all-open.out
+grep -F 'service-api' all-open.out >/dev/null
+grep -F 'service-web' all-open.out >/dev/null
+"$guard" status service-web > web-open.out
+grep -F 'OPEN / manual' web-open.out >/dev/null
+if grep -F "$api/.env" web-open.out >/dev/null; then echo 'Named status included another operation' >&2; exit 1; fi
+
+# Recovery must secure the original scope even after rule edits, beside a live peer.
+kill -KILL "$supervisor"
+if wait "$supervisor"; then echo 'Killed session reported success' >&2; exit 1; fi
+trap - 0
+"$guard" status service-api > named-recovery.out
+grep -F 'OPEN / recovery required' named-recovery.out >/dev/null
+reject_scope unlock service-api
+reject_scope unlock nested-recovery --path "$api/child"
+printf '%s\n' 'unused.fixture' > "$rules/.indexingsecrets"
+"$guard" lock service-api
+locked "$api/.env" && locked "$api/child/.env" && opened "$web/.env" || exit 1
+[ "$(cat "$api/.env")" = 'edited under api' ]
+if SUDO_UID=2000 "$guard" lock service-web > wrong-user.log 2>&1; then echo 'A different UID closed named manual access' >&2; exit 1; fi
+"$guard" lock service-web
+locked "$web/.env" && untouched "$web/local/.env" || exit 1
+printf '%s\n' '.env' '.env.*' > "$rules/.indexingsecrets"
+
+# Two admissions that race for the same scope cannot both leave manual access open.
+"$guard" unlock race-a --path "$web" > race-a.log 2>&1 &
+first=$!
+"$guard" unlock race-b --path "$web" > race-b.log 2>&1 &
+second=$!
+wins=0
+if wait "$first"; then wins=1; winner=race-a; fi
+if wait "$second"; then wins=$((wins+1)); winner=race-b; fi
+[ "$wins" = 1 ] && opened "$web/.env" || { echo "Overlapping admissions produced $wins winners" >&2; exit 1; }
+"$guard" lock "$winner"
+locked "$web/.env" && locked "$api/.env" || exit 1
+
+# An explicit path has its own operation identity. Absolute and relative spellings
+# of that same path select it, even if a named profile also points to the directory.
+(cd "$projects"; "$guard" unlock ./api-extra)
+opened "$web/.env" && locked "$api/.env" && untouched "$web/local/.env" || exit 1
+"$guard" status "$web" > direct-status.out
+grep -F 'OPEN / manual' direct-status.out >/dev/null
+reject_scope lock service-web
+reject_scope unlock another-web --path "$web"
+exec 3<"$web/.env"
+if setsid --fork --wait "$guard" lock "$web" 3<&- </dev/null > direct-busy.log 2>&1; then
+    echo 'Direct path lock ignored an open descriptor' >&2; exit 1
+fi
+grep -F "$web/.env" direct-busy.log >/dev/null
+exec 3<&-
+"$guard" status "$web" > direct-recovery.out
+grep -F 'OPEN / recovery required' direct-recovery.out >/dev/null
+reject_scope lock service-web
+(cd "$projects"; "$guard" lock ./api-extra)
+locked "$web/.env" && locked "$api/.env" || exit 1
+"$guard" session "$api" -- /bin/sh -ec 'test -w "$1"' sh "$api/.env"
+locked "$api/.env" && untouched "$api/.env.[key]" || exit 1
+
+# Once a session's close is durable, a stalled terminal write must not obstruct
+# a disjoint session attempting its own close. Hold both command sessions open.
+gate_command='
+    touch "$1/close-ready"
+    for attempt in $(seq 1 300); do [ -e "$1/close-go" ] && exit 0; sleep 0.1; done
+    exit 1
+'
+pipe="$projects/slow-output"
+mkfifo "$pipe"
+exec 4<>"$pipe"
+"$guard" session service-api -- /bin/sh -eu -c "$gate_command" sh "$api" 2>"$pipe" &
+slow=$!
+"$guard" session service-web -- /bin/sh -eu -c "$gate_command" sh "$web" > closing-peer.log 2>&1 &
+peer=$!
+trap 'kill -KILL "$slow" "$peer" 2>/dev/null || :; wait "$slow" || :; wait "$peer" || :' 0
+for attempt in $(seq 1 100); do
+    [ -f "$api/close-ready" ] && [ -f "$web/close-ready" ] && break
+    kill -0 "$slow" && kill -0 "$peer" || exit 1
+    sleep 0.1
+done
+[ -f "$api/close-ready" ] && [ -f "$web/close-ready" ] || exit 1
+if dd if=/dev/zero of="$pipe" bs=1 count=2097152 oflag=nonblock status=none 2> full-pipe.log; then
+    echo 'Did not fill the supervisor output pipe' >&2; exit 1
+fi
+touch "$api/close-go"
+for attempt in $(seq 1 100); do
+    [ ! -e /var/lib/secret-guard/named-service-api/session.json ] && locked "$api/.env" && break
+    sleep 0.1
+done
+[ ! -e /var/lib/secret-guard/named-service-api/session.json ] && locked "$api/.env" || exit 1
+kill -0 "$slow"
+touch "$web/close-go"
+peer_result=0
+wait "$peer" || peer_result=$?
+dd if="$pipe" of=/dev/null bs=4096 count=1 status=none
+wait "$slow"
+exec 4>&-
+trap - 0
+if [ "$peer_result" != 0 ]; then cat closing-peer.log >&2; exit "$peer_result"; fi
+locked "$web/.env"
+echo 'PASS: absolute and relative excludes, concurrent named and direct sessions, overlap rejection and targeted crash recovery'
 GUEST

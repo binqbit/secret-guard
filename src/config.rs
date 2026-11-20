@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
 
 use crate::journal::{self, ConfigFiles, RuleList};
-use crate::state::Session;
+use crate::sessions;
 use crate::{editor, runtime};
 
 #[derive(Subcommand)]
@@ -59,17 +59,21 @@ fn reset(selected_user: Option<&str>) -> Result<i32> {
     }
     let user = runtime::resolve_user(selected_user)?;
     let store = journal::JournalStore::open()?;
-    ensure!(
-        store.try_exclusive()?,
-        "another Secret Guard operation is active; finish it before resetting the configuration"
-    );
-    if let Some(session) = store.load::<Session>()? {
+    let _admission = store.admission()?;
+    if let Some(entry) = sessions::operations(&store)?.first() {
+        let label = entry.slot.label(entry.root());
+        ensure!(
+            entry.idle,
+            "session {label} is active; finish it before resetting the configuration"
+        );
+        let session = entry.session.as_ref().context("missing session state")?;
         let state = if session.is_manual_open() {
             "files are manually unlocked"
         } else {
             "an unfinished operation needs recovery"
         };
-        bail!("{state}; run 'sudo secret-guard lock' before resetting the configuration");
+        let hint = sessions::close_hint(&entry.slot, entry.root());
+        bail!("session {label}: {state}. {hint}");
     }
     journal::reset_config(&user.home)?;
     println!("Restored the three installed rule lists to their packaged defaults.");

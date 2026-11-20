@@ -251,8 +251,8 @@ fn lease_is_exclusive(fd: &File) -> Result<bool> {
 }
 
 pub(crate) struct Root {
-    path: PathBuf,
-    fd: File,
+    pub(crate) path: PathBuf,
+    pub(crate) fd: File,
 }
 
 impl Root {
@@ -399,7 +399,7 @@ fn open_beneath(fd: &File, path: &Path, flags: OFlags) -> rustix::io::Result<Fil
     fs::openat2(fd, path, flags | OFlags::CLOEXEC, Mode::empty(), WITHIN).map(File::from)
 }
 
-fn check_root(root: &Root) -> Result<()> {
+pub(crate) fn check_root(root: &Root) -> Result<()> {
     let current = File::from(
         fs::openat2(
             fs::CWD,
@@ -423,6 +423,10 @@ fn same_inode(a: &Metadata, b: &Metadata) -> bool {
 }
 
 impl Tree {
+    pub(crate) fn roots(&self) -> &[Root] {
+        &self.roots
+    }
+
     pub fn new(
         paths: &[PathBuf],
         patterns: &[String],

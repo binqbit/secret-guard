@@ -40,6 +40,10 @@ impl Session {
         &self.scope
     }
 
+    pub fn root_ids(&self) -> &[(u64, u64)] {
+        &self.roots
+    }
+
     pub fn manual_scope(&self) -> Option<&Scope> {
         match self.phase {
             Phase::ManualOpening | Phase::Manual | Phase::ManualClosing => Some(self.scope()),
@@ -157,15 +161,16 @@ pub fn open_files(
 
 /// Closing starts with a fresh scan so new files and editor replacements get locked too.
 pub fn close(
-    store: &JournalStore,
     tree: &Tree,
     user: &User,
     signals: &SessionSignals,
+    check_other_sessions: impl Fn() -> Result<()>,
 ) -> Result<()> {
     loop {
+        check_other_sessions()?;
         let pending = close_pass(tree, user)?;
         if pending.is_empty() {
-            return store.finish();
+            return Ok(());
         }
         signals.wait_for_retry(&pending)?;
     }

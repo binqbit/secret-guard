@@ -14,6 +14,9 @@ use crate::tree::{
     IgnoreRule, Root, Rule, acl_allows_public_read, check_directory_search, descriptor_path,
 };
 
+mod registry;
+pub use registry::{Binding, validate_session_name};
+
 const CONFIG_DIR: &str = "/etc/secret-guard";
 const STATE: &str = "/var/lib/secret-guard";
 const SESSION: &str = "session.json";
@@ -259,10 +262,14 @@ impl ConfigFiles {
     }
 
     pub fn read_all(&self) -> Result<Vec<(RuleList, String)>> {
+        self.read_lists(&RuleList::ALL)
+    }
+
+    fn read_lists(&self, lists: &[RuleList]) -> Result<Vec<(RuleList, String)>> {
         self.check_ready()?;
         let mut held = Vec::new();
         let mut contents = Vec::new();
-        for list in RuleList::ALL {
+        for &list in lists {
             let (file, text) = self.capture(list)?;
             held.push((list, file));
             contents.push((list, text));
@@ -282,13 +289,17 @@ impl ConfigFiles {
         Ok(contents)
     }
 
-    fn scope(&self) -> Result<crate::Scope> {
+    fn scope(&self, root: Option<&Path>) -> Result<crate::Scope> {
         let mut scope = crate::Scope {
-            roots: Vec::new(),
+            roots: root.into_iter().map(Path::to_path_buf).collect(),
             patterns: Vec::new(),
             ignores: Vec::new(),
         };
-        for (list, raw) in self.read_all()? {
+        let lists = match root {
+            Some(_) => &[RuleList::Secrets, RuleList::Ignore][..],
+            None => &RuleList::ALL,
+        };
+        for (list, raw) in self.read_lists(lists)? {
             let entries = list.entries(&raw)?;
             match list {
                 RuleList::Folders => scope.roots = entries.into_iter().map(Into::into).collect(),
@@ -415,8 +426,8 @@ impl ConfigFiles {
     }
 }
 
-pub fn read_config() -> Result<crate::Scope> {
-    ConfigFiles::open()?.scope()
+pub fn read_config(root: Option<&Path>) -> Result<crate::Scope> {
+    ConfigFiles::open()?.scope(root)
 }
 
 fn render_folders(template: &str, home: &Path) -> Result<String> {
@@ -574,13 +585,17 @@ impl JournalStore {
             fs::openat(parent, name, directory_flags(), Mode::empty())
                 .context("open private state directory")?,
         );
+        // Covers a racing first open which observed the just-created directory.
+        parent.sync_all()?;
+        Self::from_directory(directory, uid, gid)
+    }
+
+    fn from_directory(directory: File, uid: u32, gid: u32) -> Result<Self> {
         let m = directory.metadata()?;
         ensure!(
             m.uid() == uid && m.gid() == gid && m.mode() & 0o7777 == 0o700,
             "state directory must be owned by {uid}:{gid} with mode 0700"
         );
-        // Covers a racing first open which observed the just-created directory.
-        parent.sync_all()?;
         let store = Self {
             directory,
             uid,
@@ -605,8 +620,26 @@ impl JournalStore {
         }
     }
 
+    pub fn holds_lock(&self) -> bool {
+        self.locked.get()
+    }
+
+    pub fn release(&self) -> Result<()> {
+        self.require_lock()?;
+        loop {
+            match fs::flock(&self.directory, FlockOperation::Unlock) {
+                Ok(()) => {
+                    self.locked.set(false);
+                    return Ok(());
+                }
+                Err(Errno::INTR) => continue,
+                Err(e) => return Err(e).context("unlock private state directory"),
+            }
+        }
+    }
+
     fn require_lock(&self) -> Result<()> {
-        ensure!(self.locked.get(), "operation requires exclusive state lock");
+        ensure!(self.holds_lock(), "operation requires exclusive state lock");
         Ok(())
     }
 
@@ -794,7 +827,8 @@ mod tests {
         let uid = directory.metadata()?.uid();
         let gid = directory.metadata()?.gid();
         disk::set_permissions(tmp.path(), disk::Permissions::from_mode(0o755))?;
-        let read_lists = || ConfigFiles::from_directory(directory.try_clone()?, uid, gid)?.scope();
+        let read_lists =
+            || ConfigFiles::from_directory(directory.try_clone()?, uid, gid)?.scope(None);
         let write = |name: &str, text: &str| -> Result<()> {
             let path = tmp.path().join(name);
             disk::write(&path, text)?;
@@ -852,7 +886,7 @@ mod tests {
         let old_meta = old.metadata()?;
         // Reading and repairing the selected list does not depend on the other two.
         assert_eq!(config.read(list)?, original);
-        assert!(config.scope().is_err());
+        assert!(config.scope(None).is_err());
         let writer = File::open(tmp.path())?;
         fs::flock(&writer, FlockOperation::NonBlockingLockExclusive)?;
         assert!(config.replace(list, original, edited).is_err());
@@ -894,7 +928,7 @@ mod tests {
         let marker = tmp.path().join(RESET_PENDING);
         disk::write(&marker, RESET_SIGNATURE)?;
         disk::set_permissions(&marker, disk::Permissions::from_mode(0o600))?;
-        assert!(config.scope().is_err());
+        assert!(config.scope(None).is_err());
         assert!(config.read_all().is_err());
         assert!(config.read(RuleList::Folders).is_err());
         assert!(
@@ -917,7 +951,7 @@ mod tests {
         let reader = File::open(tmp.path())?;
         fs::flock(&reader, FlockOperation::NonBlockingLockExclusive)?;
         assert!(config.reset(home).is_err());
-        config.scope()?;
+        config.scope(None)?;
         assert!(!marker.exists());
         assert_eq!(disk::read(&extra)?, b"keep");
         assert_eq!(disk::read_dir(tmp.path())?.count(), 4);
@@ -1027,6 +1061,25 @@ mod tests {
         next.finish()?;
         assert_eq!(next.load::<u32>()?, None);
         assert_eq!(disk::read_dir(&path)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn released_store_can_be_reacquired_by_another_descriptor() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("state");
+        let first = JournalStore::open_test(&path)?;
+        let second = JournalStore::open_test(&path)?;
+        assert!(first.try_exclusive()?);
+        assert!(first.holds_lock());
+        assert!(!second.try_exclusive()?);
+        assert!(!second.holds_lock());
+        first.release()?;
+        assert!(!first.holds_lock());
+        assert!(second.try_exclusive()?);
+        assert!(first.save(&0).is_err());
+        second.release()?;
+        assert!(first.try_exclusive()?);
         Ok(())
     }
 
