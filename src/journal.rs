@@ -1,7 +1,8 @@
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result, ensure};
@@ -27,7 +28,7 @@ enum Storage {
 }
 
 // Open each component relative to the checked parent. Keep the final descriptor pinned.
-fn trusted_directory(path: &Path, storage: Storage) -> Result<File> {
+fn trusted_path(path: &Path, storage: Storage) -> Result<File> {
     // An ordinary config reader needs search access, but need not be able to
     // list every ancestor. Only the final directory requires a readable handle.
     let lookup = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -52,6 +53,11 @@ fn trusted_directory(path: &Path, storage: Storage) -> Result<File> {
             check_directory_search(&directory, Path::new(component.as_os_str()))?;
         }
     }
+    Ok(directory)
+}
+
+fn trusted_directory(path: &Path, storage: Storage) -> Result<File> {
+    let directory = trusted_path(path, storage)?;
     Ok(fs::openat(&directory, ".", directory_flags(), Mode::empty())?.into())
 }
 
@@ -119,6 +125,14 @@ impl RuleList {
 
     pub fn name(self) -> &'static str {
         self.filename().trim_start_matches(".indexing")
+    }
+
+    fn defaults(self, home: &Path) -> Result<Cow<'static, str>> {
+        match self {
+            Self::Folders => Ok(render_folders(include_str!("../.indexingfolders"), home)?.into()),
+            Self::Secrets => Ok(include_str!("../.indexingsecrets").into()),
+            Self::Ignore => Ok(include_str!("../.indexingignore").into()),
+        }
     }
 
     fn entries(self, contents: &str) -> Result<Vec<String>> {
@@ -262,6 +276,117 @@ impl ConfigFiles {
 
 pub fn read_config() -> Result<crate::Scope> {
     ConfigFiles::open()?.scope()
+}
+
+fn render_folders(template: &str, home: &Path) -> Result<String> {
+    let mut output = String::with_capacity(template.len());
+    for line in template.split_inclusive('\n') {
+        let entry = line.trim();
+        if entry == "/home/user" || entry.starts_with("/home/user/") {
+            let text = home
+                .to_str()
+                .context("account home cannot be represented in a UTF-8 rule list")?
+                .trim_end_matches('/');
+            ensure!(
+                home.is_absolute()
+                    && home.parent().is_some()
+                    && !home.components().any(|part| part == Component::ParentDir)
+                    && text.trim() == text
+                    && !text.contains(['\r', '\n', '\0']),
+                "account home {home:?} cannot be used as a search root"
+            );
+            output.push_str(&line.replacen("/home/user", text, 1));
+        } else {
+            output.push_str(line);
+        }
+    }
+    Ok(output)
+}
+
+fn uninitialized_at(parent: &File, uid: u32, gid: u32) -> Result<bool> {
+    let directory = match fs::openat(parent, "secret-guard", directory_flags(), Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(Errno::NOENT) => return Ok(true),
+        Err(e) => return Err(e).context(CONFIG_DIR),
+    };
+    check_directory_search(&directory, Path::new(CONFIG_DIR))?;
+    let files = ConfigFiles::from_directory(directory, uid, gid)?;
+    for entry in Dir::read_from(&files.directory)? {
+        if !matches!(entry?.file_name().to_bytes(), b"." | b"..") {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub fn is_uninitialized() -> Result<bool> {
+    let parent = trusted_path(Path::new("/etc"), Storage::Rules)?;
+    uninitialized_at(&parent, 0, 0)
+}
+
+pub fn initialize_if_needed(home: &Path) -> Result<()> {
+    let parent = trusted_directory(Path::new("/etc"), Storage::Rules)?;
+    initialize_at(&parent, home, 0, 0).context("initialize /etc/secret-guard")
+}
+
+fn stage_defaults(
+    parent: &File,
+    home: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<(tempfile::TempDir, File)> {
+    let staged = tempfile::Builder::new()
+        .prefix(".secret-guard-init-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(descriptor_path(parent))?;
+    let directory = File::open(staged.path())?;
+    let owner = Some(Uid::from_raw(uid));
+    let group = Some(Gid::from_raw(gid));
+    fs::fchown(&directory, owner, group)?;
+    // Published rules use public read access even when /etc has a restrictive default ACL.
+    // Change only our new objects. Remove the inherited default before creating any files.
+    for acl in ["system.posix_acl_access", "system.posix_acl_default"] {
+        match fs::fremovexattr(&directory, acl) {
+            Ok(()) | Err(Errno::NODATA | Errno::OPNOTSUPP) => (),
+            Err(e) => {
+                return Err(e).context("clear inherited ACL from new configuration directory");
+            }
+        }
+    }
+    for list in RuleList::ALL {
+        let mut file = File::from(fs::openat(
+            &directory,
+            list.filename(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?);
+        file.write_all(list.defaults(home)?.as_bytes())?;
+        fs::fchown(&file, owner, group)?;
+        fs::fchmod(&file, Mode::from_bits_retain(0o644))?;
+        file.sync_all()?;
+    }
+    Ok((staged, directory))
+}
+
+fn initialize_at(parent: &File, home: &Path, uid: u32, gid: u32) -> Result<()> {
+    if !uninitialized_at(parent, uid, gid)? {
+        return Ok(());
+    }
+    let (staged, directory) = stage_defaults(parent, home, uid, gid)?;
+    fs::fchmod(&directory, Mode::from_bits_retain(0o755))?;
+    directory.sync_all()?;
+    // Linux rename installs a complete directory at an absent or empty destination.
+    // A competing publisher or administrator who populated it first keeps their files.
+    let name = staged
+        .path()
+        .file_name()
+        .context("missing staged directory name")?;
+    match fs::renameat(parent, name, parent, "secret-guard") {
+        Ok(()) => (),
+        Err(Errno::EXIST | Errno::NOTEMPTY) if !uninitialized_at(parent, uid, gid)? => (),
+        Err(e) => return Err(e).context("publish default configuration directory"),
+    }
+    parent.sync_all().context("sync default configuration")
 }
 
 pub struct JournalStore {
@@ -424,6 +549,95 @@ mod tests {
     use super::*;
     use std::fs as disk;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn render_home_placeholders_as_complete_path_components() -> Result<()> {
+        let template = "# /home/user\n  /home/user/projects  \r\n/home/users\n/home/user";
+        let expected = "# /home/user\n  /srv/Local User/projects  \r\n/home/users\n/srv/Local User";
+        assert_eq!(
+            render_folders(template, Path::new("/srv/Local User/"))?,
+            expected
+        );
+        for invalid in [
+            "/",
+            "relative",
+            " ",
+            "/srv/../..",
+            "/srv/name\n/extra",
+            "/srv/end ",
+            "/srv/end /",
+        ] {
+            assert!(render_folders(template, Path::new(invalid)).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn competing_first_runs_publish_one_complete_default_configuration() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let parent = File::open(tmp.path())?;
+        let meta = parent.metadata()?;
+        let (uid, gid) = (meta.uid(), meta.gid());
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|s| -> Result<()> {
+            let first = s.spawn(|| {
+                barrier.wait();
+                initialize_at(&parent, Path::new("/srv/alice"), uid, gid)
+            });
+            barrier.wait();
+            let second = initialize_at(&parent, Path::new("/workspace/bob"), uid, gid);
+            first.join().unwrap()?;
+            second
+        })?;
+        let config =
+            ConfigFiles::from_directory(File::open(tmp.path().join("secret-guard"))?, uid, gid)?;
+        let folders = config.read(RuleList::Folders)?;
+        assert!(
+            folders == RuleList::Folders.defaults(Path::new("/srv/alice"))?
+                || folders == RuleList::Folders.defaults(Path::new("/workspace/bob"))?
+        );
+        for list in [RuleList::Secrets, RuleList::Ignore] {
+            assert_eq!(config.read(list)?, list.defaults(Path::new("/"))?);
+        }
+        let rules = tmp.path().join("secret-guard/.indexingignore");
+        disk::write(rules, "local-only/\n")?;
+        initialize_at(&parent, Path::new("/"), uid, gid)?;
+        assert_eq!(config.read(RuleList::Ignore)?, "local-only/\n");
+        assert_eq!(disk::read_dir(tmp.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn only_absent_or_verified_empty_configuration_can_be_initialized() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let parent = File::open(tmp.path())?;
+        let meta = parent.metadata()?;
+        let (uid, gid) = (meta.uid(), meta.gid());
+        let path = tmp.path().join("secret-guard");
+        assert!(initialize_at(&parent, Path::new("/"), uid, gid).is_err());
+        assert_eq!(disk::read_dir(tmp.path())?.count(), 0);
+
+        let outside = tempfile::tempdir()?;
+        symlink(outside.path(), &path)?;
+        assert!(initialize_at(&parent, Path::new("/srv/alice"), uid, gid).is_err());
+        assert_eq!(disk::read_dir(outside.path())?.count(), 0);
+        disk::remove_file(&path)?;
+        disk::create_dir(&path)?;
+        disk::set_permissions(&path, disk::Permissions::from_mode(0o777))?;
+        assert!(initialize_at(&parent, Path::new("/srv/alice"), uid, gid).is_err());
+        disk::set_permissions(&path, disk::Permissions::from_mode(0o755))?;
+        for file in ["config.toml", ".indexingsecrets"] {
+            let existing = path.join(file);
+            disk::write(&existing, "original")?;
+            initialize_at(&parent, Path::new("/srv/alice"), uid, gid)?;
+            assert_eq!(disk::read(&existing)?, b"original");
+            assert_eq!(disk::read_dir(&path)?.count(), 1);
+            disk::remove_file(&existing)?;
+        }
+        initialize_at(&parent, Path::new("/srv/alice"), uid, gid)?;
+        assert_eq!(disk::read_dir(&path)?.count(), 3);
+        Ok(())
+    }
 
     #[test]
     fn configuration_uses_three_editable_lists() -> Result<()> {

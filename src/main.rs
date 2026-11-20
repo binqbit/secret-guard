@@ -24,7 +24,7 @@ use tree::Tree;
     about = "Switch local files between public-read and root-only permissions"
 )]
 struct Cli {
-    /// Select the ordinary account for sessions and editing when invoking directly as root.
+    /// Select the ordinary account when invoking directly as root.
     #[arg(long, global = true, value_name = "USER")]
     user: Option<String>,
     #[command(subcommand)]
@@ -172,13 +172,16 @@ fn mutate(
 
 fn run(cli: Cli) -> Result<i32> {
     let Cli { action, user } = cli;
+    let uid = rustix::process::getuid();
+    ensure!(
+        uid == rustix::process::geteuid(),
+        "use a regular installation of secret-guard and invoke it through sudo"
+    );
     if let Action::Config { command } = action {
         return config::run(command, user.as_deref());
     }
-    ensure!(
-        unsafe { libc::geteuid() == 0 && libc::getuid() == 0 },
-        "run Secret Guard through sudo"
-    );
+    ensure!(uid.is_root(), "run Secret Guard through sudo");
+    let user = runtime::resolve_user(user.as_deref())?;
     let store = JournalStore::open()?;
     let idle = store.try_exclusive()?;
     if !idle && matches!(action, Action::Lock | Action::Session { .. }) {
@@ -192,8 +195,8 @@ fn run(cli: Cli) -> Result<i32> {
     } else if session.is_some() && idle {
         eprintln!("Unfinished operation found. {RECOVERY}");
     }
+    journal::initialize_if_needed(&user.home)?;
     let scope = journal::read_config()?;
-    let user = runtime::resolve_user(user.as_deref())?;
     let tree = Tree::new(&scope.roots, &scope.patterns, &scope.ignores, user.uid)?;
     match action {
         Action::Config { .. } => unreachable!(),

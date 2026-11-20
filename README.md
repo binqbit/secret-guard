@@ -13,42 +13,32 @@ Secret Guard changes the owner and permissions of each file in place. Its conten
 
 ### 1. Install the CLI
 
-On Linux 5.6 or later, use a recent stable Rust toolchain with Cargo. From the repository root, build as your ordinary user and install the binary. On a **first install**, also install the three example lists.
+On Linux 5.6 or later, use a recent stable Rust toolchain with Cargo. Build as your ordinary user from the repository root. The binary includes the three `.indexing*` files from that build as its configuration defaults.
 
 ```sh
 cargo build --release --locked
 sudo install -D -o root -g root -m 0755 target/release/secret-guard /usr/local/bin/secret-guard
-sudo install -d -o root -g root -m 0755 /etc/secret-guard
-sudo install -o root -g root -m 0644 .indexingfolders .indexingsecrets .indexingignore /etc/secret-guard/
 ```
-
-For a binary update, keep your installed lists. If they use the old private permissions, finish any open session with the installed binary first. Review the lists for paths, patterns and public comments, then update their permissions in place before replacing the binary.
-
-```sh
-sudo chmod 0644 /etc/secret-guard/.indexingfolders /etc/secret-guard/.indexingsecrets /etc/secret-guard/.indexingignore
-sudo chmod 0755 /etc/secret-guard
-```
-
-If the CLI reports an access ACL error after the upgrade, check the named file or directory. An ACL entry can still deny a particular user read access to a list or traversal through its parent. [Linux access control lists](https://man7.org/linux/man-pages/man5/acl.5.html)
 
 If sudo cannot find `secret-guard`, use `/usr/local/bin/secret-guard` in its place.
 
-### 2. Choose where to look and what to protect
+### 2. Initialize and review the rules
 
-Secret Guard reads three lists from **`/etc/secret-guard/`**. Any local user or agent can read them without sudo, including while secrets are locked. Only root can edit or replace the installed lists. Their paths, patterns and comments are public, so keep credential values in `.secrets/`. The files at the root of this repository are installation templates.
-
-Run `config show` as your ordinary user to see the contents of all three lists under the headings `[folders]`, `[secrets]` and `[ignore]`. Open the folder list in your current terminal with `config edit`.
+From the ordinary account that owns your secrets, display the rules. On first use, Secret Guard creates the three lists under **`/etc/secret-guard/`** from its embedded defaults. Running `config show` as an ordinary user requests sudo for this initial setup. Afterward, anyone can read the installed lists without sudo, including while secrets are locked.
 
 ```sh
 secret-guard config show
-secret-guard config edit folders
 ```
 
-Replace `/home/alice/work` with the absolute path of an existing project. The walkthrough below uses `/srv/work/api`. Every directory on the way to a managed file must let all users traverse it. For example, a home directory with mode `0700` blocks public access even if the file inside is `0644`. Secret Guard reports the blocking directory before unlocking. Choose a project location suitable for shared reading.
+The default search root is **the whole home directory of the ordinary user who first invokes sudo for setup**. Secret Guard replaces `/home/user` in the folder template with the home recorded for that UID in the system account database. For a user whose home is `/srv/users/alice`, the installed list contains `/srv/users/alice`. From a root shell, select the intended account explicitly with `secret-guard --user alice config show`.
+
+The installed lists are system-wide. Normal use and binary upgrades preserve your edits. If an installed list is missing, restore it before using the configuration. Only root can change the lists. Their paths, patterns and comments are public, so keep credential values in `.secrets/`.
+
+To manage a single project, run `secret-guard config edit folders` and replace the home entry with that project's absolute path before locking. The walkthrough below uses `/srv/work/api`. All local users must be able to traverse every parent of a file to unlock it. A private home with mode `0700` prevents unlocking files beneath it, even when the selected root is a project inside that home. Secret Guard reports the blocking directory.
 
 | Installed list | What to put in it | Example entries, one per line |
 | --- | --- | --- |
-| [.indexingfolders](.indexingfolders) | Absolute directories to scan. Each command scans all listed roots, regardless of your working directory. | `/srv/work/api`, `/srv/work/web` |
+| [.indexingfolders](.indexingfolders) | Absolute directories to scan. File operations cover all listed roots, regardless of your working directory. | `/srv/work/api`, `/srv/work/web` |
 | [.indexingsecrets](.indexingsecrets) | Names or glob patterns of files to protect. A directory rule protects its contents recursively. | `.env`, `.env.*`, `.secrets/` |
 | [.indexingignore](.indexingignore) | Files to skip and directories to skip entirely. An ignore rule wins over a secret rule. | `.git/`, `target/`, `node_modules/`, `.env.example`, `.env.*.example` |
 
@@ -167,6 +157,15 @@ Secret Guard's own scan uses the three installed lists. A real `.env` can theref
 
 <details>
 <summary>Upgrading from an older configuration or storage format</summary>
+
+If your installed lists use the old private permissions, finish any open session with the installed binary first. Review the lists for paths, patterns and public comments, then update their permissions in place before replacing the binary.
+
+```sh
+sudo chmod 0644 /etc/secret-guard/.indexingfolders /etc/secret-guard/.indexingsecrets /etc/secret-guard/.indexingignore
+sudo chmod 0755 /etc/secret-guard
+```
+
+If the CLI reports an access ACL error after the upgrade, check the named file or directory. An ACL entry can still deny a particular user read access to a list or traversal through its parent. [Linux access control lists](https://man7.org/linux/man-pages/man5/acl.5.html)
 
 Finish any open session with the previously installed version. For a TOML configuration, put each former `roots` entry on its own line in `.indexingfolders`. Transfer `patterns` or the contents of `patterns_file` to `.indexingsecrets`, and the entries from `ignore_file` to `.indexingignore`. If the old `user` setting restricted callers, apply that restriction in your sudo policy. Run `scan` from the account that originally owned the files to check the migrated rules.
 

@@ -1,3 +1,3 @@
 # Search these directories. Use one absolute path per line.
-# Replace this example with an existing project directory before installation.
-/home/alice/work
+# First use fills in the invoking user's home from the system account database.
+/home/user

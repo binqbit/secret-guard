@@ -3,15 +3,15 @@ use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use clap::Subcommand;
 
-use crate::journal::{ConfigFiles, RuleList};
+use crate::journal::{self, ConfigFiles, RuleList};
 use crate::{editor, runtime};
 
 #[derive(Subcommand)]
 pub enum Action {
-    /// Show all three installed lists, including comments.
+    /// Show all three lists, initializing the installed defaults on first use.
     Show,
     /// Open one installed list in a terminal editor.
     Edit {
@@ -40,15 +40,31 @@ fn show() -> Result<()> {
     Ok(())
 }
 
+fn run_with_sudo(selected_user: Option<&str>, args: &[&str]) -> Result<i32> {
+    // Keep the caller's terminal and let sudo apply the host's normal policy.
+    let mut sudo = Command::new("sudo");
+    sudo.arg("--").arg(env::current_exe()?);
+    if let Some(user) = selected_user {
+        sudo.args(["--user", user]);
+    }
+    Err(sudo.arg("config").args(args).exec()).context("start sudo for Secret Guard configuration")
+}
+
 pub fn run(action: Action, selected_user: Option<&str>) -> Result<i32> {
-    let Action::Edit { list, editor } = action else {
-        show()?;
-        return Ok(0);
+    let (list, editor) = match action {
+        Action::Show => {
+            if journal::is_uninitialized()? {
+                if !rustix::process::geteuid().is_root() {
+                    return run_with_sudo(selected_user, &["show"]);
+                }
+                let user = runtime::resolve_user(selected_user)?;
+                journal::initialize_if_needed(&user.home)?;
+            }
+            show()?;
+            return Ok(0);
+        }
+        Action::Edit { list, editor } => (list, editor),
     };
-    ensure!(
-        rustix::process::getuid() == rustix::process::geteuid(),
-        "use a regular installation of secret-guard and invoke it through sudo"
-    );
     runtime::check_interactive().context("config edit requires a foreground terminal")?;
     let preferred = editor.or_else(|| {
         ["VISUAL", "EDITOR"]
@@ -57,19 +73,14 @@ pub fn run(action: Action, selected_user: Option<&str>) -> Result<i32> {
             .find(|value| !value.is_empty())
     });
     if !rustix::process::geteuid().is_root() {
-        // Keep the caller's terminal and let sudo apply the host's normal policy.
-        let mut sudo = Command::new("sudo");
-        sudo.arg("--").arg(env::current_exe()?);
-        if let Some(user) = selected_user {
-            sudo.args(["--user", user]);
+        let mut args = vec!["edit", list.name()];
+        if let Some(program) = preferred.as_deref() {
+            args.extend(["--editor", program]);
         }
-        sudo.args(["config", "edit", list.name()]);
-        if let Some(program) = &preferred {
-            sudo.arg("--editor").arg(program);
-        }
-        return Err(sudo.exec()).context("start sudo for config edit");
+        return run_with_sudo(selected_user, &args);
     }
     let user = runtime::resolve_user(selected_user)?;
+    journal::initialize_if_needed(&user.home)?;
     let original = ConfigFiles::open()?.read(list)?;
     if let Some(edited) =
         editor::edit_text(&user, list.filename(), &original, preferred.as_deref())?

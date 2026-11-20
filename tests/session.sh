@@ -7,6 +7,7 @@ if [ "$#" != 1 ] || [ "$(id -u)" != 0 ]; then
     exit 2
 fi
 binary=$(realpath "$1")
+templates=$(realpath "$(dirname "$0")/..")
 [ -x "$binary" ] || { echo "Missing executable: $binary" >&2; exit 2; }
 case "$binary" in
     /etc/*|/var/lib/*) echo "Place the test executable outside /etc and /var/lib." >&2; exit 2 ;;
@@ -14,15 +15,16 @@ esac
 
 # No fixtures are created until both private mounts succeed. Their contents
 # disappear with this mount namespace. Requires util-linux and GNU coreutils.
-exec unshare --mount --propagation private sh -eu -s -- "$binary" <<'GUEST'
+exec unshare --mount --propagation private sh -eu -s -- "$binary" "$templates" <<'GUEST'
 guard=$1
+templates=$2
 mount -n -t tmpfs -o mode=0755,nodev,nosuid tmpfs /etc
 mount -n -t tmpfs -o mode=0755,nodev,nosuid tmpfs /var/lib
 export SUDO_UID=1000
 cat > /etc/passwd <<'ACCOUNTS'
 root:x:0:0:Root:/root:/bin/sh
-editor:x:1000:1000:Editor:/:/bin/sh
-reader:x:2000:2000:Reader:/:/bin/sh
+editor:x:1000:1000:Editor:/var/lib/editor home:/bin/sh
+reader:x:2000:2000:Reader:/var/lib/reader home:/bin/sh
 ACCOUNTS
 printf '%s\n' 'root:x:0:' 'editor:x:1000:' 'reader:x:2000:' > /etc/group
 printf '%s\n' 'passwd: files' 'group: files' > /etc/nsswitch.conf
@@ -30,20 +32,61 @@ printf '%s\n' 'passwd: files' 'group: files' > /etc/nsswitch.conf
 work=/var/lib/sg-test-work
 rules=/etc/secret-guard
 as_reader() { setpriv --reuid=2000 --regid=2000 --clear-groups "$@"; }
-install -d -m 0755 "$rules"
-printf '%s\n' "$work" > "$rules/.indexingfolders"
-printf '%s\n' '.env' '.env.*' '.secrets/' > "$rules/.indexingsecrets"
-printf '%s\n' 'target/' > "$rules/.indexingignore"
-chmod 0644 "$rules/.indexingfolders" "$rules/.indexingsecrets" "$rules/.indexingignore"
+editor_home='/var/lib/editor home'
+reader_home='/var/lib/reader home'
+install -d -o 1000 -g 1000 -m 0755 "$editor_home"
+install -d -o 2000 -g 2000 -m 0755 "$reader_home"
 # Give both ordinary accounts access to the binary even if the build directory is private.
 install -m 0755 "$guard" /var/lib/sg-test-cli
 guard=/var/lib/sg-test-cli
+
+# First use from outside the checkout gets the packaged defaults and the NSS home.
+cd /var/lib
+if (unset SUDO_UID; "$guard" config show) > no-user.log 2>&1; then
+    echo 'Root without a caller initialized rules for an arbitrary account' >&2; exit 1
+fi
+[ ! -e "$rules" ]
+if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m d:u:2000:--- /etc
+fi
+(umask 0077; HOME=/root USER=root LOGNAME=root "$guard" config show) > first-show.out
+[ "$(stat -c '%u:%g:%a' "$rules")" = '0:0:755' ]
+grep -Fx "$editor_home" "$rules/.indexingfolders" >/dev/null
+cmp "$templates/.indexingsecrets" "$rules/.indexingsecrets"
+cmp "$templates/.indexingignore" "$rules/.indexingignore"
+[ ! -e /var/lib/secret-guard ]
 for name in .indexingfolders .indexingsecrets .indexingignore; do
     file="$rules/$name"
+    [ "$(stat -c '%u:%g:%a' "$file")" = '0:0:644' ]
     as_reader cat "$file" >/dev/null
     if as_reader sh -c ': >> "$1"' sh "$file" 2>/dev/null; then echo "Reader can write $name" >&2; exit 1; fi
     if as_reader rm "$file" 2>/dev/null; then echo "Reader can remove $name" >&2; exit 1; fi
 done
+if command -v setfacl >/dev/null 2>&1; then
+    setfacl -k /etc
+    echo 'PASS: public bootstrap rules with restrictive inherited ACL'
+fi
+
+# A precreated empty directory also supports setup for an explicitly selected account.
+mv "$rules" /etc/editor-defaults
+install -d -m 0755 "$rules"
+(unset SUDO_UID; "$guard" --user reader config show) > reader-show.out
+grep -Fx "$reader_home" "$rules/.indexingfolders" >/dev/null
+mv "$rules" /etc/reader-defaults
+
+# Status can be the first command, showing the session and current file permissions.
+printf '%s\n' 'bootstrap fixture' > "$editor_home/.env"
+chown 1000:1000 "$editor_home/.env"
+chmod 0644 "$editor_home/.env"
+HOME=/root "$guard" status > first-status.out
+grep -Fx 'No open session.' first-status.out >/dev/null
+grep -Fx "public-read mode  1000:1000 0644  \"$editor_home/.env\"" first-status.out >/dev/null
+cmp /etc/editor-defaults/.indexingfolders "$rules/.indexingfolders"
+
+mv /var/lib/secret-guard /var/lib/first-status-state
+
+printf '%s\n' "$work" > "$rules/.indexingfolders"
+printf '%s\n' 'target/' > "$rules/.indexingignore"
 install -d -m 0755 -o 1000 -g 1000 "$work" "$work/.secrets" "$work/target"
 cd "$work"
 printf 'before\n' > .env
@@ -58,7 +101,7 @@ inode=$(stat -c '%d:%i' .env)
 printf '%s\n' '# review the paths before the first scan' "$work" > "$rules/.indexingfolders"
 : > "$rules/.indexingignore"
 chmod 0711 /etc
-as_reader "$guard" config show > show.out
+as_reader env PATH=/no-sudo "$guard" config show > show.out
 chmod 0755 /etc
 for entry in '[folders]' '[secrets]' '[ignore]' '# review the paths before the first scan' "$work" '.secrets/'; do
     grep -Fx "$entry" show.out >/dev/null

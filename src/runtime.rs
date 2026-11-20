@@ -18,7 +18,7 @@ pub struct User {
     pub name: String,
     pub uid: u32,
     pub gid: u32,
-    home: PathBuf,
+    pub home: PathBuf,
     shell: PathBuf,
     groups: Vec<libc::gid_t>,
 }
